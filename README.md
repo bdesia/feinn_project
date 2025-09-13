@@ -3,7 +3,9 @@ CEIA FIUBA - Final Project - Finite Element-Integrated Neural Network framework
 
 ## About this project
 
-To complete
+The FEINN framework integrates finite element methods with neural networks to create a hybrid approach for solving partial differential equations (PDEs) and other computationally intensive problems. This project aims to leverage the strengths of FEM for spatial discretization and neural networks for adaptive learning, enabling efficient and accurate solutions for engineering and physics-based applications.
+
+This project was developed as part of the CEIA (Curso de Especialización en Inteligencia Artificial) at FIUBA (Facultad de Ingeniería, Universidad de Buenos Aires).
 
 ## Project structure
 
@@ -17,7 +19,7 @@ The project was structured as follows.
     └── tests                           # Unit tests for all the packages in the source code
 ```
 
-## Requirements
+## Prerequisites
 
 - Python > 3.11
 - Poetry 2.1.4
