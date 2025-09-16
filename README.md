@@ -14,7 +14,7 @@ The project was structured as follows.
 ```
 ├── data                                # Data. Here must be FE results used as ground-truth
 ├── notebooks                           # Jupyter notebooks for interactive data analysis or modeling 
-│   └── Test                            # Sub-folder of notebooks used for code testing
+│   └── test                            # Sub-folder of notebooks used for code testing
 └── src                                 # Main source of the project
     └── tests                           # Unit tests for all the packages in the source code
 ```
