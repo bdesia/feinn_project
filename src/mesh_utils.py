@@ -10,7 +10,7 @@ class Mesh2D:
         elements (ndarray): (nelem x nnode) array with element connectivity (1-based node indices).
         nnod (int): Number of nodes.
         nelem (int): Number of elements.
-        nnode (int): Number of nodes per element (assumes homogeneous mesh).
+        nnode (int): Number of nodes per element.
         ndof (int): Total number of degrees of freedom (nnod * ndof_by_node).
         node_groups (dict): Dictionary mapping group names to sets of node indices (1-based).
         element_groups (dict): Dictionary mapping group names to sets of element indices (1-based).
@@ -25,18 +25,18 @@ class Mesh2D:
             elements (list or ndarray): (nelem x nnode) array of connectivity (1-based indices).
             ndof_by_node (int, optional): Degrees of freedom per node. Defaults to 2 for 2D.
         """
-        self.nodes = np.array(coordinates, dtype=float)
+        self.coordinates = np.array(coordinates, dtype=float)
         self.elements = np.array(elements, dtype=int)
         
-        self.nnod = self.nodes.shape[0]
-        self.nelem = self.elements.shape[0]
-        self.nnode = self.elements.shape[1]  # Assumes all elements have same nnode
-        self.ndof = self.nnod * ndof_by_node  # Total DOFs
-        self.node_groups = {}  # Initialize empty node groups
-        self.element_groups = {}  # Initialize empty element groups
+        self.nnod = self.coordinates.shape[0]         # Number of nodes
+        self.nelem = self.elements.shape[0]     # Number of elements
+        self.nnode = self.elements.shape[1]     # Number of nodes by element. Assumes all elements have same nnode
+        self.ndof = self.nnod * ndof_by_node    # Total DOFs
+        self.node_groups = {}                   # Initialize empty node groups
+        self.element_groups = {}                # Initialize empty element groups
         
         # Validation
-        if self.nodes.shape[1] != 2:
+        if self.coordinates.shape[1] != 2:
             raise ValueError("Coordinates must be 2D (nnod x 2).")
         if np.any(self.elements < 1) or np.any(self.elements > self.nnod):
             raise ValueError("Element indices must be between 1 and nnod.")
@@ -51,7 +51,7 @@ class Mesh2D:
         Returns:
             ndarray: [x, y] coordinates of the node.
         """
-        return self.nodes[node_id - 1]
+        return self.coordinates[node_id - 1]
     
     def get_element_nodes(self, elem_id):
         """
@@ -107,7 +107,7 @@ class Mesh2D:
             fig, ax = plt.subplots()
         
         # Plot all nodes
-        ax.scatter(self.nodes[:, 0], self.nodes[:, 1], c='black', s=20, label='Nodes')
+        ax.scatter(self.coordinates[:, 0], self.coordinates[:, 1], c='black', s=20, label='Nodes')
         
         # Define element node order for plotting edges (based on Library2DFE.m)
         if self.nnode == 4:
@@ -122,12 +122,12 @@ class Mesh2D:
         # Plot elements
         for i in range(self.nelem):
             elem_nodes = self.get_element_nodes(i + 1) - 1  # Convert to 0-based for NumPy
-            x = self.nodes[elem_nodes[edge_order], 0]
-            y = self.nodes[elem_nodes[edge_order], 1]
+            x = self.coordinates[elem_nodes[edge_order], 0]
+            y = self.coordinates[elem_nodes[edge_order], 1]
             ax.plot(x, y, 'b-', alpha=0.5, label='Elements' if i == 0 else None)
             if show_element_ids:
                 # Plot element ID at centroid
-                centroid = np.mean(self.nodes[elem_nodes, :], axis=0)
+                centroid = np.mean(self.coordinates[elem_nodes, :], axis=0)
                 ax.text(centroid[0], centroid[1], str(i + 1), color='blue', ha='center', va='center')
         
         # Plot node groups with different colors
@@ -136,7 +136,7 @@ class Mesh2D:
             for group, color in zip(node_groups_to_plot, colors):
                 if group in self.node_groups:
                     node_indices = np.array(list(self.node_groups[group])) - 1  # Convert to 0-based
-                    ax.scatter(self.nodes[node_indices, 0], self.nodes[node_indices, 1], 
+                    ax.scatter(self.coordinates[node_indices, 0], self.coordinates[node_indices, 1], 
                               c=[color], s=50, label=group)
         
         # Plot element groups with different edge colors
@@ -146,14 +146,14 @@ class Mesh2D:
                 if group in self.element_groups:
                     for i in self.element_groups[group]:
                         elem_nodes = self.get_element_nodes(i) - 1
-                        x = self.nodes[elem_nodes[edge_order], 0]
-                        y = self.nodes[elem_nodes[edge_order], 1]
+                        x = self.coordinates[elem_nodes[edge_order], 0]
+                        y = self.coordinates[elem_nodes[edge_order], 1]
                         ax.plot(x, y, c=color, alpha=0.8, label=group if i == min(self.element_groups[group]) else None)
         
         # Plot node IDs if requested
         if show_node_ids:
             for i in range(self.nnod):
-                ax.text(self.nodes[i, 0], self.nodes[i, 1], str(i + 1), color='black', fontsize=8)
+                ax.text(self.coordinates[i, 0], self.coordinates[i, 1], str(i + 1), color='black', fontsize=8)
         
         # Set plot properties
         ax.set_xlabel('X')
@@ -217,7 +217,7 @@ class UniformQuadMesh2D(Mesh2D):
         self.ndof_by_node = int(ndof_by_node)
         
         # Initialize inherited attributes as None until compute() is called
-        self.nodes = None
+        self.coordinates = None
         self.elements = None
         self.nnod = 0
         self.nelem = 0
@@ -225,7 +225,7 @@ class UniformQuadMesh2D(Mesh2D):
         self.ndof = 0
         self.node_groups = {}
         self.element_groups = {}
-    
+        
     def compute(self):
         """
         Generate nodes and element connectivity for a uniform quadrilateral mesh.
@@ -254,8 +254,8 @@ class UniformQuadMesh2D(Mesh2D):
         x = np.linspace(0, self.lx, npx)
         y = np.linspace(0, self.ly, npy)
         X, Y = np.meshgrid(x, y)
-        self.nodes = np.column_stack((X.ravel(), Y.ravel()))
-        self.nnod = self.nodes.shape[0]
+        self.coordinates = np.column_stack((X.ravel(), Y.ravel()))
+        self.nnod = self.coordinates.shape[0]
         
         # Generate element connectivity
         self.nelem = self.nx * self.ny

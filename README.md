@@ -42,3 +42,4 @@ Follow this steps:
     ```bash
     poetry env activate
     ```
+1. Now, you're ready to run the notebooks and make your own simulations.
