@@ -26,6 +26,8 @@ poetry add --group dev ipykernel
 # Registra el kernel en Jupyter
 poetry run python -m ipykernel install --user --name=$PROJECT_NAME --display-name "Python ($PROJECT_NAME)"
 
+poetry add torch==2.6.0+cpu --source pytorch-cpu
+
 # Ahora, obtiene la ruta del entorno virtual precisamente donde está en realidad
 VENV_PATH=$(poetry env info --path)
 
