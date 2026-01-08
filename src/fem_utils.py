@@ -96,6 +96,8 @@ def QuadShapeDerivatives(r: torch.Tensor, s: torch.Tensor, nnode: int) -> torch.
                dHrs[..., 1, :] = ∂N/∂s
     """
 
+    torch.set_default_dtype(torch.float64)
+
     batch_shape = r.shape
     device = r.device
 
@@ -194,6 +196,8 @@ def GaussQuad(ngp: int) -> Tuple[torch.Tensor, torch.Tensor]:
     Wi : torch.tensor
         Tensor with the Gauss point weigths. Dimension (1 , ngp)
     """
+
+    torch.set_default_dtype(torch.float64)
 
     if ngp == 1:		    # 1 integration point
         Ri=torch.tensor([0.0000]) # Points
