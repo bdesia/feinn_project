@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from fem_elements import QuadElement
 
 class Mesh2D:
     """
@@ -7,16 +8,12 @@ class Mesh2D:
     
     Attributes:
         nodes (ndarray): (nnod x 2) array with [x, y] coordinates of nodes.
-        elements (ndarray): (nelem x nnode) array with element connectivity (1-based node indices).
-        nnod (int): Number of nodes.
-        nelem (int): Number of elements.
-        nnode (int): Number of nodes per element.
-        ndof (int): Total number of degrees of freedom (nnod * ndof_by_node).
+        elements (list): List of elements, each element is an Element object
         node_groups (dict): Dictionary mapping group names to sets of node indices (1-based).
         element_groups (dict): Dictionary mapping group names to sets of element indices (1-based).
     """
     
-    def __init__(self, coordinates, elements, ndof_by_node=2):
+    def __init__(self):
         """
         Initialize the mesh with coordinates and connectivity.
         
@@ -25,23 +22,20 @@ class Mesh2D:
             elements (list or ndarray): (nelem x nnode) array of connectivity (1-based indices).
             ndof_by_node (int, optional): Degrees of freedom per node. Defaults to 2 for 2D.
         """
-        self.coordinates = np.array(coordinates, dtype=float)
-        self.elements = np.array(elements, dtype=int)
-        
-        self.nnod = self.coordinates.shape[0]         # Number of nodes
-        self.nelem = self.elements.shape[0]     # Number of elements
-        self.nnode = self.elements.shape[1]     # Number of nodes by element. Assumes all elements have same nnode
-        self.ndof = self.nnod * ndof_by_node    # Total DOFs
+        self.coordinates = []
+        self.elements = []
+        self.nnod = 0
+        self.nelem = 0
         self.node_groups = {}                   # Initialize empty node groups
         self.element_groups = {}                # Initialize empty element groups
-        
-        # Validation
-        if self.coordinates.shape[1] != 2:
-            raise ValueError("Coordinates must be 2D (nnod x 2).")
-        if np.any(self.elements < 1) or np.any(self.elements > self.nnod):
-            raise ValueError("Element indices must be between 1 and nnod.")
     
-    def get_node_coords(self, node_id):
+    def add_node(self, x: float, y: float):
+        self.coordinates.append(np.array[x, y])
+
+    def add_element(self, element: object):
+        self.elements.append(element)
+
+    def get_node_coords(self, node_id: int):
         """
         Return coordinates of a specific node (1-based index).
         
@@ -53,7 +47,7 @@ class Mesh2D:
         """
         return self.coordinates[node_id - 1]
     
-    def get_element_nodes(self, elem_id):
+    def get_element_nodes(self, elem_id: int):
         """
         Return nodes of a specific element (1-based index).
         
@@ -63,32 +57,51 @@ class Mesh2D:
         Returns:
             ndarray: Array of node indices (1-based) for the element.
         """
-        return self.elements[elem_id - 1]
+        if elem_id > 0:
+            return self.elements[elem_id - 1].nodes
+        else:
+            raise ValueError("Element id must be between 1 and nelem.")
     
-    def add_node_group(self, group_name, node_indices):
+    def add_node_group(self, group_name: str, node_indices: list):
         """
         Add a group of nodes under a specified name.
         
         Args:
             group_name (str): Name of the node group.
-            node_indices (list or set): Set of node indices (1-based).
+            node_indices (list): Set of node indices (1-based).
         """
         self.node_groups[group_name] = set(node_indices)
         if not all(1 <= idx <= self.nnod for idx in node_indices):
             raise ValueError("Node indices must be between 1 and nnod.")
     
-    def add_element_group(self, group_name, element_indices):
+    def add_element_group(self, group_name: str, element_indices: list):
         """
         Add a group of elements under a specified name.
         
         Args:
             group_name (str): Name of the element group.
-            element_indices (list or set): Set of element indices (1-based).
+            element_indices (list): Set of element indices (1-based).
         """
         self.element_groups[group_name] = set(element_indices)
         if not all(1 <= idx <= self.nelem for idx in element_indices):
             raise ValueError("Element indices must be between 1 and nelem.")
-    
+
+    def find_nodes(self, value: float, axis: int, tol = 1e-10):
+        """
+        Find node IDs where the specified coordinate (x or y) is approximately equal to a given value.
+
+        Args:
+            value (float): The coordinate value to search for.
+            axis (int): The axis to consider (1 for x-coordinate, 2 for y-coordinate).
+            tol (float): Tolerance for matching the coordinate value. Defaults to 1e-10.
+
+        Returns:
+        list[int]: List of node IDs (starting from 1) that satisfy the condition.      
+        """
+        mask = np.abs(self.coordinates[:, axis - 1] - value) < tol
+        node_ids = np.where(mask)[0] + 1  
+        return node_ids.tolist()
+
     def plot(self, node_groups_to_plot=None, element_groups_to_plot=None, show_node_ids=False, show_element_ids=False, ax=None):
         """
         Plot the 2D mesh using Matplotlib, with options to highlight node/element groups.
@@ -109,19 +122,10 @@ class Mesh2D:
         # Plot all nodes
         ax.scatter(self.coordinates[:, 0], self.coordinates[:, 1], c='black', s=20, label='Nodes')
         
-        # Define element node order for plotting edges (based on Library2DFE.m)
-        if self.nnode == 4:
-            edge_order = [0, 1, 2, 3, 0]  # Q4: top-right, top-left, bottom-left, bottom-right, close
-        elif self.nnode == 8:
-            edge_order = [0, 4, 1, 5, 2, 6, 3, 7, 0]  # Q8: top-right, mid-top, top-left, mid-left, ...
-        elif self.nnode == 9:
-            edge_order = [0, 4, 1, 5, 2, 6, 3, 7, 0]  # Q9: same as Q8 for edges, center node (8) ignored
-        else:
-            raise ValueError(f"Unsupported number of nodes per element: {self.nnode}")
-        
         # Plot elements
         for i in range(self.nelem):
             elem_nodes = self.get_element_nodes(i + 1) - 1  # Convert to 0-based for NumPy
+            edge_order = self.elements[i].edge_order
             x = self.coordinates[elem_nodes[edge_order], 0]
             y = self.coordinates[elem_nodes[edge_order], 1]
             ax.plot(x, y, 'b-', alpha=0.5, label='Elements' if i == 0 else None)
@@ -159,10 +163,10 @@ class Mesh2D:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_title('2D Finite Element Mesh')
-        ax.grid(True)
+        # ax.grid(True)
         ax.legend()
         ax.set_aspect('equal')  # Ensure equal scaling for x and y axes
-        return ax
+        return
 
 class UniformQuadMesh2D(Mesh2D):
     """
@@ -170,11 +174,9 @@ class UniformQuadMesh2D(Mesh2D):
     
     Attributes (inherited from Mesh2D, set after compute()):
         nodes (ndarray): (nnod x 2) array with [x, y] coordinates of nodes.
-        elements (ndarray): (nelem x nnode) array with element connectivity (1-based indices).
+        elements (list): (nelem) list with element objetcs
         nnod (int): Number of nodes.
         nelem (int): Number of elements.
-        nnode (int): Number of nodes per element (4, 8, or 9).
-        ndof (int): Total degrees of freedom (nnod * ndof_by_node).
         node_groups (dict): Dictionary mapping group names to sets of node indices (1-based).
         element_groups (dict): Dictionary mapping group names to sets of element indices (1-based).
     
@@ -184,10 +186,10 @@ class UniformQuadMesh2D(Mesh2D):
         nx (int): Number of elements in x-direction.
         ny (int): Number of elements in y-direction.
         element_type (str): Quadrilateral element type ('Q4', 'Q8', 'Q9').
-        ndof_by_node (int): Degrees of freedom per node.
     """
     
-    def __init__(self, lx, ly, nx, ny, element_type='Q4', ndof_by_node=2):
+    def __init__(self, lx: float, ly: float, nx: int, ny: int, element_type='Q4'):
+        super().__init__()
         """
         Initialize the uniform quadrilateral mesh parameters. Call compute() to generate the mesh.
         
@@ -197,7 +199,6 @@ class UniformQuadMesh2D(Mesh2D):
             nx (int): Number of elements in x-direction.
             ny (int): Number of elements in y-direction.
             element_type (str, optional): Element type ('Q4', 'Q8', 'Q9'). Defaults to 'Q4'.
-            ndof_by_node (int, optional): Degrees of freedom per node. Defaults to 2.
         
         Raises:
             ValueError: If element_type is invalid or inputs are non-positive.
@@ -214,17 +215,6 @@ class UniformQuadMesh2D(Mesh2D):
         self.nx = int(nx)
         self.ny = int(ny)
         self.element_type = element_type.upper()
-        self.ndof_by_node = int(ndof_by_node)
-        
-        # Initialize inherited attributes as None until compute() is called
-        self.coordinates = None
-        self.elements = None
-        self.nnod = 0
-        self.nelem = 0
-        self.nnode = 0
-        self.ndof = 0
-        self.node_groups = {}
-        self.element_groups = {}
         
     def compute(self):
         """
@@ -238,63 +228,107 @@ class UniformQuadMesh2D(Mesh2D):
         Returns:
             None
         """
-        # Determine node grid size and element properties
-        if self.element_type == 'Q4':
-            step = 1
-            npx = self.nx + 1  # Node points in x
-            npy = self.ny + 1  # Node points in y
-            self.nnode = 4
-        else:  # Q8 or Q9
-            step = 2
-            npx = 2 * self.nx + 1
-            npy = 2 * self.ny + 1
-            self.nnode = 8 if self.element_type == 'Q8' else 9
-        
-        # Generate node coordinates using meshgrid
-        x = np.linspace(0, self.lx, npx)
-        y = np.linspace(0, self.ly, npy)
-        X, Y = np.meshgrid(x, y)
-        self.coordinates = np.column_stack((X.ravel(), Y.ravel()))
-        self.nnod = self.coordinates.shape[0]
-        
-        # Generate element connectivity
+
+        # -----------------------------------------------
+        # NODES GENERATION
+        # -----------------------------------------------
+
+        npe = 4 if self.element_type == 'Q4' else 8 if self.element_type == 'Q8' else 9
+
+        step1 = self.lx / self.nx
+        step2 = self.ly / self.ny
+        a = 1.0
+        if npe == 8 or npe == 9:
+            step2 = step2 / 2
+            a = 0.5
+
+        # x1 = np.arange(0, self.lx + a * step1, a * step1)
+        x2 = np.arange(0, self.ly + step2, step2)
+
+        coordinates = []
+        k = 1
+        for j in x2:
+            for i in np.arange(0, self.lx + (step1 * a), step1 * a):
+                coordinates.append([i, j])
+                k += 1
+            if npe == 8:
+                a = 1.5 - a  # Alternar entre 0.5 y 1.0 para zigzag
+
+        self.coordinates = np.array(coordinates)
+        self.nnod = len(self.coordinates)
+
+        # -----------------------------------------------
+        # ELEMENT GENERATION
+        # -----------------------------------------------
+
+        aux = 1
+        m = 1
+        n = 1
+        l = 1
+
+        if npe == 4:
+            b = 1
+            c = 2
+        elif npe == 8:
+            b = 3
+            c = 4
+            p = 1
+        elif npe == 9:
+            b = 4
+            c = 4
+            p = 2
+
         self.nelem = self.nx * self.ny
-        elements = np.zeros((self.nelem, self.nnode), dtype=int)
-        elem_idx = 0
-        for ey in range(self.ny):
-            for ex in range(self.nx):
-                base_i = ex * step
-                base_j = ey * step
-                # Corner nodes (1-based)
-                bottom_left = base_j * npx + base_i + 1
-                bottom_right = base_j * npx + (base_i + step) + 1
-                top_left = (base_j + step) * npx + base_i + 1
-                top_right = (base_j + step) * npx + (base_i + step) + 1
-                
-                if self.element_type == 'Q4':
-                    elements[elem_idx] = [top_right, top_left, bottom_left, bottom_right]
-                
-                elif self.element_type in ['Q8', 'Q9']:
-                    # Mid-side nodes
-                    bottom_mid = base_j * npx + (base_i + step // 2) + 1
-                    right_mid = (base_j + step // 2) * npx + (base_i + step) + 1
-                    top_mid = (base_j + step) * npx + (base_i + step // 2) + 1
-                    left_mid = (base_j + step // 2) * npx + base_i + 1
-                    elem = [top_right, top_left, bottom_left, bottom_right,
-                            top_mid, left_mid, bottom_mid, right_mid]
-                    if self.element_type == 'Q9':
-                        center = (base_j + step // 2) * npx + (base_i + step // 2) + 1
-                        elem.append(center)
-                    elements[elem_idx] = elem
-                
-                elem_idx += 1
+
+        for h in range(self.nelem):
+            connectivity = np.zeros(npe, dtype=int)
+
+            connectivity[0] = b * self.nx + c + m
+            connectivity[1] = b * self.nx + m + (c // 2)
+            connectivity[2] = m
+            connectivity[3] = m + (c // 2)
+
+            if npe != 4:
+                connectivity[4] = b * self.nx + c + m - 1
+                connectivity[5] = 2 * self.nx + aux + l
+                connectivity[6] = m + (c // 2) - 1
+                connectivity[7] = 2 * self.nx + aux + l + p
+                if npe == 9:
+                    connectivity[8] = 2 * self.nx + m + 2
+
+            # Actualización de contadores
+            if n == self.nx:
+                m = aux + b * self.nx + (c // 2)
+                aux = aux + b * self.nx + (c // 2)
+                n = 1
+                l = 1
+            else:
+                if npe == 4:
+                    m += 1
+                else:
+                    m += 2
+                    if npe == 8:
+                        l += 1
+                    elif npe == 9:
+                        l += 2
+                n += 1
+
+            self.elements.append(QuadElement(h+1, connectivity))
+            self.elements[h].get_nodal_coordinates(coordinates)
+
+        # -----------------------------------------------
+        # GROUP GENERATION
+        # -----------------------------------------------
         
-        self.elements = elements
-        self.ndof = self.nnod * self.ndof_by_node
-        
-       # Add boundary node groups
-        self.node_groups['bottom'] = set(range(1, npx + 1))  # Bottom edge (y=0)
-        self.node_groups['top'] = set(range((npy - 1) * npx + 1, npy * npx + 1))  # Top edge
-        self.node_groups['left'] = set(range(1, npy * npx + 1, npx))  # Left edge (x=0)
-        self.node_groups['right'] = set(range(npx, npy * npx + 1, npx))  # Right edge
-        self.element_groups['all'] = set(range(1, self.nelem + 1))  # All elements
+        self.node_groups['all']    = list(range(1, self.nnod + 1))
+        self.node_groups['bottom'] = find_nodes(0.0, axis=2)
+        self.node_groups['top']    = find_nodes(self.ly, axis=2)
+        self.node_groups['left']   = find_nodes(0.0, axis=1)
+        self.node_groups['right']  = find_nodes(self.lx, axis=1)
+
+        # --- Grupos de nodos ---
+        self.element_groups['all'] = list(range(1, self.nelem + 1))         # All elements
+        self.element_groups['bottom'] = list(range(1, self.nx + 1))        
+        self.element_groups['top'] = list(range(self.nx * (self.ny-1) + 1, self.nx * self.ny + 1))
+        self.element_groups['left'] = list(range(1, (self.ny - 1) * self.nx + 2, self.nx))
+        self.element_groups['right'] = list(range(self.nx, self.ny * self.nx + 1, self.nx))
