@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from fem_elements import QuadElement
 
 class Mesh2D:
     """
@@ -7,12 +8,9 @@ class Mesh2D:
     
     Attributes:
         nodes (ndarray): (nnod x 2) array with [x, y] coordinates of nodes.
-        elements (dict): (etype: list with element connectivity)
-        nnod (int): Number of nodes.
-        nelem (int): Number of elements.
+        elements (list): List of elements, each element is an Element object
         node_groups (dict): Dictionary mapping group names to sets of node indices (1-based).
         element_groups (dict): Dictionary mapping group names to sets of element indices (1-based).
-    
     """
     
     def __init__(self):
@@ -25,7 +23,7 @@ class Mesh2D:
             ndof_by_node (int, optional): Degrees of freedom per node. Defaults to 2 for 2D.
         """
         self.coordinates = []
-        self.elements = {}
+        self.elements = []
         self.nnod = 0
         self.nelem = 0
         self.node_groups = {}                   # Initialize empty node groups
@@ -176,7 +174,7 @@ class UniformQuadMesh2D(Mesh2D):
     
     Attributes (inherited from Mesh2D, set after compute()):
         nodes (ndarray): (nnod x 2) array with [x, y] coordinates of nodes.
-        elements (dict): (etype: list with element connectivity)
+        elements (list): (nelem) list with element objetcs
         nnod (int): Number of nodes.
         nelem (int): Number of elements.
         node_groups (dict): Dictionary mapping group names to sets of node indices (1-based).
@@ -282,7 +280,6 @@ class UniformQuadMesh2D(Mesh2D):
 
         self.nelem = self.nx * self.ny
 
-        quad_list = []
         for h in range(self.nelem):
             connectivity = np.zeros(npe, dtype=int)
 
@@ -316,10 +313,8 @@ class UniformQuadMesh2D(Mesh2D):
                         l += 2
                 n += 1
 
-            quad_list.append(connectivity)
-        
-        self.elements['quad'] = quad_list
-
+            self.elements.append(QuadElement(h+1, connectivity))
+            self.elements[h].get_nodal_coordinates(coordinates)
 
         # -----------------------------------------------
         # GROUP GENERATION

@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e  # Exit si algo falla
 
 POETRY_PYPROJECT="pyproject.toml"
 PROJECT_NAME=$(grep 'name =' $POETRY_PYPROJECT | awk -F '"' '{print $2}' | head -1)
@@ -14,14 +15,27 @@ PYTHON_VERSION="3.11"
 
 echo "Configurando entorno con Poetry..."
 
+# Crea carpeta en directorio del repo para guardar el entorno virtual
+poetry config virtualenvs.in-project true --local
+
+# Limpia caché antes de crear el entorno
+poetry cache clear pypi --all -q
+
+# Borra .venv anterior para evitar bugs si existe un entorno virtual roto
+rm -rf .venv
+
 # Usa o crea un virtualenv con la versión específica de Python
 poetry env use $PYTHON_VERSION
 
 # Instala todas las dependencias del proyecto
 poetry install
 
+# Instala las dependencias principales del proyecto
+poetry install --only main
+poetry sync
+
 # Instala herramientas de desarrollo
-poetry add --group dev ipykernel
+poetry run pip install --quiet ipykernel jupyterlab-widgets==3.0.13 widgetsnbextension
 
 # Registra el kernel en Jupyter
 poetry run python -m ipykernel install --user --name=$PROJECT_NAME --display-name "Python ($PROJECT_NAME)"

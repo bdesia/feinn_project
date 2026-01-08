@@ -1,8 +1,5 @@
 import numpy as np
-import torch
-import torch.nn as nn
 from dataclasses import dataclass
-from fem_elements import QuadElement
 
 # ----------------------------------------------------------------------
 # Boundary Conditions classes
@@ -57,11 +54,6 @@ class BodyLoad:
         """Return the load as a NumPy array [bx, by]."""
         return np.array([self.bx, self.by], dtype=float)
     
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [bx, by]."""
-        return torch.tensor([self.bx, self.by], dtype=torch.float64)
-    
 class BodyLoads(dict):
     """Only accepts BodyLoad objects."""
     def __setitem__(self, key: str, value: BodyLoad) -> None:
@@ -107,12 +99,7 @@ class EdgeLoad:
     def vector(self) -> np.ndarray:
         """Return the load as a NumPy array [ftangential, fnormal]."""
         return np.array([self.ftangential, self.fnormal], dtype=float)
-    
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [ftangential, fnormal]."""
-        return torch.tensor([self.ftangential, self.fnormal], dtype=torch.float64)
-    
+
 class EdgeLoads(dict):
     """Only accepts EdgeLoad objects."""
     def __setitem__(self, key: str, value: EdgeLoad) -> None:
@@ -142,12 +129,7 @@ class NodalLoad:
     def vector(self) -> np.ndarray:
         """Return the load as a NumPy array [fx, fy]."""
         return np.array([self.fx, self.fy], dtype=float)
-    
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [fx, fy]."""
-        return torch.tensor([self.fx, self.fy], dtype=torch.float64)
-    
+
 class NodalLoads(dict):
     """Only accepts NodalLoad objects."""
     def __setitem__(self, key: str, value: NodalLoad) -> None:
@@ -201,17 +183,9 @@ class BaseSolver:
         self.nodal_loads = nodal_loads          # Concentrated forces (if any)
         self.formulation = 'infinitesimal'      # "infinitesimal" / "TLF"
         self.coordinates = mesh.coordinates
-        self.elements = []
+        self.elements = mesh.elements
 
         self.verbose = verbose
-
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # === LOAD FINITE ELEMENTS ===
-        if 'quad' in mesh.elements.keys():
-            for element_index, quad_connectivity in enumerate(mesh.elements['quad']):
-                self.elements.append(QuadElement(element_index + 1, quad_connectivity))
-                self.elements[element_index].get_nodal_coordinates(self.coordinates)
 
         # === MESH ATTRIBUTES ===
         self.nnod = mesh.nnod               # Number of nodes
@@ -223,17 +197,21 @@ class BaseSolver:
         self._check_material()              # Checks if all elements have an assigned material
 
         # === INICIALIZE SOLUTION AND SOLVER DATA ===
-        self.udisp = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)  # Displacement vector initialization
+        self.udisp = np.zeros(self.ndof)   # Displacement vector initialization
+
+        # === APPLY DIRICHLET BOUNDARY CONDITIONS ===
+        self.free_dofs = self._apply_dirichlet_bcs()
+        self.fixed_dofs = set(range(self.ndof)) - set(self.free_dofs)
 
         # === ASSEMBLE EXTERNAL FORCE VECTOR ===
-        self.Fext_total = torch.zeros_like(self.udisp)
+        self.Fext_total = np.zeros(self.ndof)
         self._apply_body_loads()
         self._apply_edge_loads()
         self._apply_nodal_loads()
 
         # Current state
         self.load_factor = 0.0                              # Current λ (0 ≤ λ ≤ 1 or more)
-        self.Fext = torch.zeros_like(self.udisp)            # Current external load = λ * Fext_total
+        self.Fext = np.zeros(self.ndof)                 # Current external load = λ * Fext_total
         self.history = {
             'load_factor': [0.0],
             'displacement_error': [0.0],
@@ -241,15 +219,14 @@ class BaseSolver:
             'energetic_error': [0.0],
             'iterations': [0]
         }
-
     # ========================================
     # BASE METHODS
     # ========================================
 
     def _reinit(self):
-        self.udisp.zero_()
+        self.udisp.fill(0.0)
         self.load_factor = 0.0
-        self.Fext.zero_()
+        self.Fext.fill(0.0)
         self.history = {
             'load_factor': [0.0],
             'displacement_error': [0.0],
@@ -267,7 +244,7 @@ class BaseSolver:
             raise ValueError("Group 'all' is MANDATORY in matfld")
 
         default_material = matfld['all']
-        for elem in self.elements:
+        for elem in self.mesh.elements:
             elem.material = default_material  # Default: 'all'
 
         for group_name, material in matfld.items():
@@ -277,7 +254,7 @@ class BaseSolver:
                 print(f"[matfld] Warning: group '{group_name}' does not exist in mesh")
                 continue
             for elem_id in self.mesh.element_groups[group_name]:
-                self.elements[elem_id - 1].material = material
+                self.mesh.elements[elem_id - 1].material = material
 
         if self.verbose:
             print(f"[matfld] Assigned: {list(matfld.keys())}")
@@ -287,100 +264,45 @@ class BaseSolver:
         Checks that every element has a material assigned.
         Raises error if any element has material = None.
         """
-        missing = [elem.id for elem in self.elements if elem.material is None]
+        missing = [elem.id for elem in self.mesh.elements if elem.material is None]
         if missing:
             raise ValueError(f"Elements without material: {missing}")
         if self.verbose:
             print(f"[matfld] All {self.nelem} elements have assigned material")
 
-    def _get_dirichlet_bc_data(self) -> list[dict]:
-        """
-        Process all Dirichlet boundary conditions and return a structured list.
-        
-        Returns
-        -------
-        list[dict]
-            Each dict contains:
-            - 'group_name': str
-            - 'nodes_0': torch.LongTensor (n_nodes,)           # 0-based node indices
-            - 'dofs': torch.LongTensor (n_conditions,)         # global DOFs affected
-            - 'values': torch.DoubleTensor (n_conditions,)     # prescribed values
-        """
-        bc_data_list = []
-
-        for group_name, bc_input in self.bcs.items():
-            if group_name not in self.mesh.node_groups:
-                if self.verbose:
-                    print(f"[BC] Warning: group '{group_name}' not found in mesh.node_groups. Skipping.")
-                continue
-
-            # Convert 1-based node IDs → 0-based tensor
-            node_ids_1based = self.mesh.node_groups[group_name]
-            nodes_0 = torch.tensor(
-                [nid - 1 for nid in node_ids_1based],
-                dtype=torch.long,
-                device=self.device
-            )  # shape: (n_nodes_in_group,)
-
-            # Allow single BoundaryCondition or list
-            bc_list = bc_input if isinstance(bc_input, list) else [bc_input]
-
-            # Process all BCs in this group
-            for bc in bc_list:
-                if not isinstance(bc, BoundaryCondition):
-                    raise TypeError(f"Expected BoundaryCondition, got {type(bc)}")
-
-                dof_local = bc.dof  # 1 → ux (offset 0), 2 → uy (offset 1)
-                if dof_local not in (1, 2):
-                    raise ValueError(f"Invalid dof {dof_local}. Must be 1 (ux) or 2 (uy).")
-
-                value = bc.value
-
-                # Vectorized computation of global DOFs
-                # global_dof = 2 * node_id + (dof_local - 1)
-                offset = dof_local - 1  # 0 for ux, 1 for uy
-                dofs = 2 * nodes_0 + offset  # shape: (n_nodes_in_group,)
-
-                # Constant prescribed value repeated for all nodes in group
-                values = torch.full_like(dofs, fill_value=value, dtype=torch.float64)
-
-                bc_data_list.append({
-                    'group_name': group_name,
-                    'nodes_0': nodes_0,                    # same for all BCs in group
-                    'dofs': dofs,                          # LongTensor, global DOFs
-                    'values': values,                      # DoubleTensor, prescribed values
-                })
-
-        # Optional debug info
-        if self.verbose and bc_data_list:
-            total_conditions = sum(len(item['dofs']) for item in bc_data_list)
-            print(f"[BC] Processed {len(bc_data_list)} Dirichlet condition(s) → {total_conditions} total constraint(s)")
-
-        return bc_data_list
-
     def _apply_dirichlet_bcs(self):
         """
-        Apply hard Dirichlet boundary conditions.
+        Apply Dirichlet BCs from self.bcs.
+        Expected format:
+            bcs = {
+                'fixed_bottom': BoundaryCondition(dof=0, value=0.0),    # ux = 0
+                'bottom': [ BoundaryCondition(dof=1, value=0.0),        # ux = 0
+                            BoundaryCondition(dof=2, value=0.0)         # uy = 0
+                         ],
+                'corner': BoundaryCondition(dof=1, value=0.1)           # ux = 0.1
+        }
         """
         fix = []
-
-        bc_list = self._get_dirichlet_bc_data()
-
-        for bc in bc_list:
-            dofs = bc['dofs']           # Prescribed DOF (1: X-DISPLACEMENT, 2: Y-DISPLACEMENT)
-            values = bc['values']       # Prescribed value
+        for group_name, bc_input in self.bcs.items():
+            if group_name not in self.mesh.node_groups:
+                print(f"[BC] Warning: group '{group_name}' not in mesh")
+                continue
             
-            self.udisp[dofs] = values   # Impose initial boundary condition
-            fix.extend(dofs.tolist())   # Record prescribed DOF
+            bc_list = bc_input if isinstance(bc_input, list) else [bc_input]   # Convert to list if single condition
 
-        all_dofs = torch.arange(self.ndof, device=self.device)
-        fixed_dofs = torch.tensor(fix, dtype=torch.long, device=self.device)
-        free_dofs = all_dofs[~torch.isin(all_dofs, fixed_dofs)]
-
+            for bc in bc_list:
+                doffix = bc.dof		                    # Prescribed DOF (1: X-DISPLACEMENT, 2: Y-DISPLACEMENT)
+                valuefix = bc.value		                # Prescribed value
+                for nid in self.mesh.node_groups[group_name]:
+                    ieqn = 2 * (nid-1) + doffix - 1	        # Prescribed DOF position
+                    self.udisp[ieqn] = valuefix		        # Impose initial boundary condition
+                    fix.append(ieqn)					    # Record prescribed DOF
+        
         if self.verbose:
-            print(f"[BC] Applied Dirichlet BCs → {len(fixed_dofs)} fixed DOFs")
+            print(f"[BC] Applied {len(self.bcs)} Dirichlet conditions")
 
-        return fixed_dofs, free_dofs
+        fix=np.array(fix)                               # Convert "fix" to numpy array
+        return np.setdiff1d(range(self.ndof),fix)		# Free DOFs
 
     def _apply_body_loads(self):
         """Apply volume (body) loads."""
@@ -393,8 +315,8 @@ class BaseSolver:
                 continue
 
             for eid in self.mesh.element_groups[group_name]:
-                elem = self.elements[eid - 1]
-                f_body = elem.compute_body_loads(load.tensor)
+                elem = self.mesh.elements[eid - 1]
+                f_body = elem.compute_body_loads(load.vector)
                 dofs = elem.dofs
                 self.Fext_total[dofs] += f_body
 
@@ -412,9 +334,9 @@ class BaseSolver:
                 continue
 
             for eid in self.mesh.element_groups[group_name]:
-                elem = self.elements[eid - 1]
+                elem = self.mesh.elements[eid - 1]
                 f_edge = elem.compute_edge_load(
-                    load.side, load.tensor, load.reference
+                    load.side, load.vector, load.reference
                 )
                 dofs = elem.dofs
                 self.Fext_total[dofs] += f_edge
@@ -446,13 +368,13 @@ class BaseSolver:
         if self.verbose:
             print(f"[nodal_load] Applied {len(self.nodal_loads)} nodal load groups")      
 
-    def _assemble_internal_forces(self, u: torch.Tensor = None) -> torch.Tensor:
+    def _assemble_internal_forces(self):
         """
         Assemble global internal force vector
         """
 
-        u = self.udisp if u is None else u
-        Fint = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)
+        u = self.udisp
+        Fint = np.zeros(self.ndof)
 
         if self.formulation == 'infinitesimal':
             compute_f = lambda elem: elem.compute_linear_intfor(u)
@@ -461,11 +383,9 @@ class BaseSolver:
         else:
             raise ValueError("Invalid formulation. Must be 'infinitesimal' or 'TLF'.")
         
-        for elem in self.elements:
-            fint_local = compute_f(elem)           # (ndof_local,)
-            dofs = elem.dofs                          # torch.long tensor, shape (ndof_local,)
-            Fint.scatter_add_(0, dofs, fint_local)
-        
+        for elem in self.mesh.elements:
+            np.add.at(Fint, elem.dofs, compute_f(elem))
+
         return Fint
 
     def set_load_factor(self, lam: float):
@@ -515,7 +435,7 @@ class BaseSolver:
         attempts = 0
 
         while self.load_factor < target_lambda:
-            udisp_old = self.udisp.clone().detach()
+            udisp_old = self.udisp.copy()
             attempts += 1
             self.update_load_factor(step_size)
             
@@ -525,7 +445,7 @@ class BaseSolver:
                 attempts = 0
             else:
                 step_size *= 0.5                # decrease step
-                self.udisp = udisp_old.clone()  # restore previous displacements
+                self.udisp = udisp_old.copy     # restore previous displacements
                 attempts += 1
 
                 if attempts > max_substeps or step_size < 1e-8:
@@ -593,7 +513,6 @@ class BaseSolver:
 
             coords = self.mesh.coordinates.copy()                   # (nnodes, 2)
             u_nodal = self.udisp.reshape(-1, 2)                     # (nnodes, 2)
-            u_nodal = u_nodal.detach().cpu().numpy()
             deformed = coords + scale * u_nodal
 
             deformed_color = '#1f77b4'
@@ -606,7 +525,7 @@ class BaseSolver:
                 # Plot all nodes
                 ax.scatter(deformed[:, 0], deformed[:, 1], c=deformed_color, s= 10)
 
-            for elem in self.elements:
+            for elem in self.mesh.elements:
 
                 # Determine element nodes (0-based)
                 elem_nodes = elem.nodes - 1
@@ -622,14 +541,14 @@ class BaseSolver:
 
                 # Plot deformed mesh
                 ax.plot(Xd, Yd, color=deformed_color, lw=1.6,
-                        label=label_def if elem is self.elements[0] else "")
+                        label=label_def if elem is self.mesh.elements[0] else "")
                 ax.fill(Xd, Yd, color=deformed_color, alpha=0.07,
-                        label="" if elem is self.elements[0] else "")
+                        label="" if elem is self.mesh.elements[0] else "")
 
                 # Optionally plot original mesh
                 if show_original:
                     ax.plot(Xo, Yo, color=original_color, lw=0.8, ls='--', 
-                            alpha=original_alpha, label=label_orig if elem is self.elements[0] else "")
+                            alpha=original_alpha, label=label_orig if elem is self.mesh.elements[0] else "")
             
             if show_original:
                 if show_nodes:
@@ -664,38 +583,16 @@ class BaseSolver:
 
             return
 
-    # def export_resu(
-    #     self,
-    #     filename: str | PathLike,
-    #     nodal_data: Dict[str, Tensor] = {},
-    #     elem_data: Dict[str, List[Tensor]] = {},
-    #       ):
-    #     from meshio import Mesh, read
-    #     etype = mesh.etype.meshio_type
-
-    #     msh = Mesh(
-    #         points=model.coordinates.cpu().detach(),
-    #         cells={etype: model.connectivity.cpu().detach()},
-    #         point_data={key: tensor.cpu().detach() for key, tensor in nodal_data.items()},
-    #         cell_data={
-    #             key: [tensor.cpu().detach() for tensor in tensor_list]
-    #             for key, tensor_list in elem_data.items()
-    #         },
-    #     )
-    #     msh.write(filename)
-
-    # export_mesh(model, "result.vtu", elem_data={"rho": [rho[-1]]})
-
 class NFEA(BaseSolver):
     """
     This class implements a nonlinear finite element solver
     """
     def __init__(self,  mesh: object, 
-                        bcs: BoundaryConditions, 
+                        bcs: object, 
                         matfld: dict, 
-                        body_loads: BodyLoads = None, 
-                        edge_loads: EdgeLoads  = None, 
-                        nodal_loads: NodalLoads  = None,
+                        body_loads: dict = None, 
+                        edge_loads: dict  = None, 
+                        nodal_loads: dict  = None,
                         verbose: bool = False):
         
         super().__init__(mesh, bcs, matfld, body_loads, edge_loads, nodal_loads, verbose)
@@ -705,27 +602,20 @@ class NFEA(BaseSolver):
         self.ftol = 1e-6        # Force tolerance
 
         self.maxit = 20         # Maximum number of iterations
-
-        # === APPLY DIRICHLET BOUNDARY CONDITIONS ===
-        self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
-
-    def _assemble_stiffness(self)-> torch.Tensor:
+    
+    def _assemble_stiffness(self):
         """
         Assemble global stiffness matrix
         """
-        K = torch.zeros(self.ndof, self.ndof, 
-                    dtype=torch.float64, device=self.device)
+        K = np.zeros((self.ndof, self.ndof))
 
-        compute_Ke = (
-            lambda e: e.compute_linear_stiff()
-            if self.formulation == 'infinitesimal' else
-            e.compute_nonlinear_stiff(self.udisp)
-        )
-
-        for elem in self.elements:
-            Ke = compute_Ke(elem)
-            dofs = elem.dofs
-            K[dofs[:, None], dofs] += Ke
+        if self.formulation == 'infinitesimal':
+            for elem in self.mesh.elements:
+                np.add.at(K, np.ix_(elem.dofs, elem.dofs), elem.compute_linear_stiff())
+        else:
+            u = self.udisp
+            for elem in self.mesh.elements:
+                np.add.at(K, np.ix_(elem.dofs, elem.dofs), elem.compute_nonlinear_stiff(u))
 
         return K
 
@@ -743,12 +633,13 @@ class NFEA(BaseSolver):
 
         it = 0                  # Iteration counter
         
-        du = torch.zeros_like(self.udisp)               # Displacement increment vector initialization
+        du = np.zeros(self.ndof)                        # Displacement increment vector initialization
+
         Fint = self._assemble_internal_forces()         # Internal force vector initalization
         residual = self.Fext - Fint
 
         # Norma inicial del residuo (solo dofs libres)
-        res_norm0 = torch.norm(residual[self.free_dofs])    # Calculate the 2-norm of residual vector 
+        res_norm0 = np.linalg.norm(residual[self.free_dofs])    # Calculate the 2-norm of residual vector 
         if res_norm0 < 1e-14:
             res_norm0 = 1.0
 
@@ -764,8 +655,8 @@ class NFEA(BaseSolver):
             residual = self.Fext - Fint	                                    # Unbalanced forces vector at iteration "it" for the n-step of time    
             res_free = residual[self.free_dofs]                             # Unbalanced forces vector at free dofs only
             # Solve for correction of the displacement increment vector at iteration "it" for the n-step
-            du[self.free_dofs] = torch.linalg.solve(
-                    Ktan[self.free_dofs][:, self.free_dofs], 
+            du[self.free_dofs] = np.linalg.solve(
+                    Ktan[np.ix_(self.free_dofs, self.free_dofs)], 
                     res_free
                 )
 
@@ -775,14 +666,14 @@ class NFEA(BaseSolver):
             residual = self.Fext - Fint                                     # Update unbalanced forces vector at iteration "it" for the n-step of time                   
 
             # --- Criterios de convergencia ---
-            du_norm = torch.norm(du[self.free_dofs])                    # Norm-2. Displacement increment vector for the n-step
-            u_norm  = torch.norm(self.udisp[self.free_dofs])            # Norm-2. Displacement vector for the n-step of the time
-            res_norm = torch.norm(residual[self.free_dofs])
+            du_norm = np.linalg.norm(du[self.free_dofs])                    # Norm-2. Displacement increment vector for the n-step
+            u_norm  = np.linalg.norm(self.udisp[self.free_dofs])            # Norm-2. Displacement vector for the n-step of the time
+            res_norm = np.linalg.norm(residual[self.free_dofs])
 
             err_d.append(du_norm / (u_norm + 1e-12))
             err_f.append(res_norm / res_norm0)
 
-            energy = torch.einsum('i, i', du, residual)                                        # Update energy
+            energy = du.T @ residual                                        # Update energy
             if it == 1:
                 energy0 = energy if energy > 1e-14 else 1.0
             err_e.append(energy / energy0)
@@ -813,243 +704,211 @@ class NFEA(BaseSolver):
             print("MAXIMUM NUMBER OF ITERATIONS REACHED - NO CONVERGENCE")
             return False
 
+
+
 # TODO: - for incremental analysis: warm-start from previous step. The NN must calculate displacements increments. Total displacements are given as u_prev + du_nn
 #       - for incremental analysis: fine-tunning from previous step. The NN must inicialize weights from previous step and then calculate total displacements u_nn
 
-
-
-DEFAULT_NNET = torch.nn.Sequential(
-    torch.nn.Linear(2, 64),
-    torch.nn.ReLU(),
-    torch.nn.Linear(64, 64),
-    torch.nn.ReLU(),
-    torch.nn.Linear(64, 2)
-)   
-
-class FEINN(BaseSolver):
+class feinn(BaseSolver):
     """
-    Finite Element Integrated Neural Network solver for 2D solid mechanics problems.
-    Dirichlet boundary conditions enforced SOFTLY via penalty method.
+    This class implements a finite element-integrated neural network solver
     """
-    
-    def __init__(self, 
-                 mesh: object, 
-                 bcs: BoundaryConditions, 
+
+    import torch
+    import torch.nn as nn
+    from dataclasses import dataclass
+
+    def __init__(self, mesh: object, 
+                 bcs: object, 
                  matfld: dict, 
-                 body_loads: BodyLoads = None, 
-                 edge_loads: EdgeLoads = None, 
-                 nodal_loads: NodalLoads = None,
-                 verbose: bool = False,
+                 body_loads: dict = None, 
+                 edge_loads: dict  = None, 
+                 nodal_loads: dict  = None,
                  nnet: nn.Module = None,
-                 nnet_init: str = None,
-                 isData: bool = False,
-                 bc_weight: float = 1e4,                # Penalty weight for soft BCs
-                 normalize_coords = True,
-                 ):
-
+                 verbose: bool = False):
+        
         super().__init__(mesh, bcs, matfld, body_loads, edge_loads, nodal_loads, verbose)
+        
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        self.isData = isData
-        self.bc_weight = bc_weight
+        def _to_torch_tensor(np_array: np.ndarray) -> torch.Tensor:
+            return torch.tensor(np_array, dtype=torch.float32, device=self.device)
+        
+        def _to_numpy_array(tensor: torch.Tensor) -> np.ndarray:
+            return tensor.cpu().detach().numpy()
 
-        # Neural network
-        self.nnet = nnet if nnet is not None else DEFAULT_NNET
-        self.nnet = self.nnet.to(self.device)
-        self.nnet.double()
+        self._to_torch_tensor = _to_torch_tensor
+        self._to_numpy_array = _to_numpy_array
 
-        # Weight initialization
-        if nnet_init == 'xavier':
+        self.coordinates_t = _to_torch_tensor(self.coordinates)
+        self.Fext_total_t = _to_torch_tensor(self.Fext_total)
+        self.Fext_t = torch.zeros_like(self.Fext_total_t)
+        self.udisp_prescribed = np.copy(self.udisp)
+        self.udisp_prescribed_t = _to_torch_tensor(self.udisp_prescribed)
+        self.free_dofs_list = list(self.free_dofs)
+        self.fixed_dofs_list = list(self.fixed_dofs)
+
+        if nnet is None:
+            class MLP(nn.Module):
+                def __init__(self, layers, activation=nn.Tanh()):
+                    super().__init__()
+                    self.layers = nn.ModuleList()
+                    for i in range(len(layers) - 1):
+                        self.layers.append(nn.Linear(layers[i], layers[i + 1]))
+                    self.activation = activation
+
+                def forward(self, x):
+                    for layer in self.layers[:-1]:
+                        x = self.activation(layer(x))
+                    return self.layers[-1](x)
+
+            self.nnet = MLP([2, 20, 20, 20, 2]).to(self.device)
             self.nnet.apply(self.init_xavier)
-        elif nnet_init == 'he':
-            self.nnet.apply(self.init_he)
-        elif nnet_init is not None:
-            raise ValueError("Invalid initialization method. Choose 'xavier', 'he', or None.")
+        else:
+            self.nnet = nnet.to(self.device)
 
-        # Nodal coordinates
-        self.coords_tensor = torch.tensor(
-            self.coordinates, dtype=torch.float64, device=self.device)  # (nnod, 2)
-        if normalize_coords:
-            self._normalize_coords()
-
-        self.loss_fun = nn.MSELoss()
-
-        if self.verbose:
-            n_params = sum(p.numel() for p in self.nnet.parameters())
-            print(f"[FEINN] Initialized with {n_params} trainable parameters")
-            print(f"[FEINN] Soft Dirichlet BC enforcement (weight = {self.bc_weight:.1e})")
-
-        # === GET FREE AND FIXED DOFS ===
-        self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
+        self.optimizer = torch.optim.Adam(self.nnet.parameters(), lr=0.001)
+        self.alpha_bc = 1e3  # Weight for soft BC enforcement
+        self.dtol = 1e-6
+        self.etol = 1e-6
+        self.ftol = 1e-6
 
     @staticmethod
     def init_xavier(m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight, gain=nn.init.calculate_gain('tanh'))
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
+        if isinstance(m, nn.Linear) and m.weight.requires_grad and m.bias.requires_grad:
+            g = nn.init.calculate_gain('tanh')
+            torch.nn.init.xavier_uniform_(m.weight, gain=g)
+            m.bias.data.fill_(0)
 
     @staticmethod
     def init_he(m):
-        if isinstance(m, nn.Linear):
-            nn.init.kaiming_uniform_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
-            if m.bias is not None:
-                m.bias.data.fill_(0.0)
+        if isinstance(m, nn.Linear) and m.weight.requires_grad and m.bias.requires_grad:
+            g = nn.init.calculate_gain('relu')
+            torch.nn.init.kaiming_uniform_(m.weight, a=g, mode='fan_in', nonlinearity='relu')
+            m.bias.data.fill_(0)
 
-    def _normalize_coords(self) -> None:
-        # Compute min and max
-        min_vals = self.coords_tensor.min(dim=0, keepdim=True).values
-        max_vals = self.coords_tensor.max(dim=0, keepdim=True).values
-        range_vals = torch.clamp(max_vals - min_vals, min=1e-12)         # Avoid division by zero
+    def _assemble_internal_forces(self, u=None):
+        if u is not None:
+            original_u = self.udisp.copy()
+            self.udisp[:] = u
+        Fint = super()._assemble_internal_forces()
+        if u is not None:
+            self.udisp[:] = original_u
+        return Fint
 
-        # Normalization between [-1, 1]
-        self.coords_tensor = 2.0 * (self.coords_tensor - min_vals) / range_vals - 1.0
-
-    def _forces_residual(self, u: torch.Tensor) -> torch.Tensor:
-        Fint = self._assemble_internal_forces(u)
-        return self.Fext_total - Fint                 
-
-    def train_one_epoch(self, model, optimizer, scheduler=None):
-
-        model.train()
-
-        loss_list = []
-        tag_keys = []
-
-        # =============================
-        # Domain loss (PDE residual)
-        # =============================
-        X_domain = self.coords_tensor               # All nodes contribute to residual
-
-        u_pred = model(X_domain)                        # (nnod, 2)              
-
-        res_pred = self._forces_residual(u_pred.reshape(-1))[self.free_dofs]        # Convert u_pred to (ndof,). Retain only free dofs
-        res_true = torch.zeros_like(res_pred)
-
-        loss_domain = self.loss_fun(res_pred, res_true)
-        loss_list.append(loss_domain)
-        tag_keys.append('Domain')
-
-        # =============================
-        # Soft Dirichlet BCs
-        # =============================
-
-        bc_data = self._get_dirichlet_bc_data()
-
-        if bc_data:
-            nodes = torch.cat([bc['nodes_0'] for bc in bc_data])
-            dofs  = torch.cat([bc['dofs']      for bc in bc_data])
-            u_true  = torch.cat([bc['values']    for bc in bc_data])
-
-            u_pred_bc = model(self.coords_tensor[nodes])[torch.arange(len(u_true)), dofs % 2]
-
-            loss_bc = self.bc_weight * self.loss_fun(u_pred_bc, u_true)
-            
-        else:
-            loss_bc = torch.tensor(0.0, device=self.device)
-
-        loss_list.append(loss_bc)
-        tag_keys.append('BoundaryConditions')
-
-        # =============================
-        # Labelled Data (optional)
-        # =============================
-        if self.isData:
-            # Placeholder: implement if you have supervised data
-            loss_data = torch.tensor(0.0, device=self.device)
-            loss_list.append(loss_data)
-            tag_keys.append('LabelledData')
-
-        # =============================
-        # Total loss
-        # =============================
-        total_loss = sum(loss_list)
-
-        # Optimization step
-        optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
-
-        loss_list.append(total_loss)
-        tag_keys.append('Overall')
-
-        return dict(zip(tag_keys, [l.item() if l.numel() > 0 else l for l in loss_list]))
-
-    def train(self, epochs: int, optimizer=None, scheduler=None, verbose=True):  # Fixed: added self
-        if self.verbose:
-            print(f"[FEINN] Starting training – max {epochs} epochs")
-
-        history = {'total': [], 'domain': [], 'bc': [], 'data': []}
-
-        model = self.nnet
-        if optimizer is None:
-            optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr = 1e-4,
-            weight_decay = 0,
-            )
-
-        for epoch in range(1, epochs + 1):
-            train_results = self.train_one_epoch(model = model, optimizer = optimizer, scheduler = scheduler)
-
-            # Logging
-            if verbose and (epoch == 1 or epoch % 500 == 0 or epoch == epochs):
-                print(f"\nEpoch {epoch}/{epochs}")
-                print(f"Total Loss: {train_results['Overall']:.3e}")
-                print(f"  Domain: {train_results['Domain']:.3e}")
-                print(f"  BC:     {train_results['BoundaryConditions']:.3e}")
-                if self.isData and 'LabelledData' in train_results:
-                    print(f"  Data:   {train_results['LabelledData']:.3e}")
-
-            # Store history
-            history['total'].append(train_results['Overall'])
-            history['domain'].append(train_results['Domain'])
-            history['bc'].append(train_results['BoundaryConditions'])
-            if self.isData and 'LabelledData' in train_results:
-                history['data'].append(train_results['LabelledData'])
-
-        # Final prediction
-        with torch.no_grad():
-            self.udisp = self.nnet(self.coords_tensor).reshape(-1).detach()
-
-        self.history = {'loss': history}  # Store properly
-
-        if self.verbose:
-            print(f"[FEINN] Training complete – final loss: {train_results['Overall']:.3e}")
-
-    def plot_history(self, title: str = None):
+    def _forces_residual(self, udisp: np.ndarray) -> torch.Tensor:
         """
-        Plot loss history during training.
+        Compute internal forces and residual given displacements.
+        """
+        Fint = self._assemble_internal_forces(udisp)
+        Fint_t = self._to_torch_tensor(Fint)
+        return self.Fext_t - Fint_t
+    
+    def set_load_factor(self, lam: float):
+        """
+        Set the current load factor λ and update external force vector.
+        """
+        super().set_load_factor(lam)
+        self.Fext_t = lam * self.Fext_total_t
+
+    def update_load_factor(self, dlam: float):
+        """
+        Update the current load factor λ and external force vector.
+        """
+        super().update_load_factor(dlam)
+        self.Fext_t = self.load_factor * self.Fext_total_t
+
+    def _incremental_step(self):
+        self.Fext_t = self.load_factor * self.Fext_total_t
+        self.fit(epochs=2000)  # Train for this step
+        self.predict()
+        # Check convergence (simplified)
+        udisp_np = self.udisp
+        residual_t = self._forces_residual(udisp_np)
+        res_norm = torch.norm(residual_t[self.free_dofs_list])
+        fext_norm = torch.norm(self.Fext_t[self.free_dofs_list]) + 1e-12
+        err_f = res_norm / fext_norm
+        if err_f < self.ftol:
+            return True
+        else:
+            print(f"Warning: Residual error {err_f:.2e} above tolerance")
+            return False
+
+    def _train_one_epoch(self):
+        """
+        Train the neural network for one epoch.
+        """
+        self.nnet.train()
+        self.optimizer.zero_grad()
+
+        udisp_t_2d = self.nnet(self.coordinates_t)  # (nnod, 2)
+        udisp_t = udisp_t_2d.flatten()  # (ndof,)
+        udisp_np = self._to_numpy_array(udisp_t)
+
+        residual_t = self._forces_residual(udisp_np)
+        loss_physics = torch.mean(residual_t[self.free_dofs_list] ** 2)
+
+        loss_bc = torch.mean((udisp_t[self.fixed_dofs_list] - self.udisp_prescribed_t[self.fixed_dofs_list]) ** 2)
+
+        loss = loss_physics + self.alpha_bc * loss_bc
+        loss.backward()
+        self.optimizer.step()
+
+        return loss.item()
+
+    def _validate_one_epoch(self):
+        """
+        Validate the neural network for one epoch.
+        """
+        # No validation data available, return dummy
+        return 0.0
+
+    def fit(self, epochs: int = 1000, lr: float = 0.001):
+        """
+        Train the neural network for multiple epochs.
+        """
+        self.optimizer = torch.optim.Adam(self.nnet.parameters(), lr=lr)
+        train_loss_history = []
+        val_loss_history = []
+
+        for epoch in range(epochs):
+            train_loss = self._train_one_epoch()
+            train_loss_history.append(train_loss)
+
+            val_loss = self._validate_one_epoch()
+            val_loss_history.append(val_loss)
+
+            if self.verbose and (epoch + 1) % 100 == 0:
+                print(f"Epoch {epoch + 1}/{epochs} | Train Loss: {train_loss:.4e} | Val Loss: {val_loss:.4e}")
+
+        return train_loss_history, val_loss_history
+    
+    def plot_training_history(self, train_loss_history, val_loss_history=None):
+        """
+        Plot training and validation loss history.
         """
         import matplotlib.pyplot as plt
-
-        # Check if history exists       
-        if not hasattr(self, 'history') or 'loss' not in self.history:
-            raise ValueError("No model has been trained yet. Execute .train() first.")
-
-        history = self.history['loss']
-
-        epochs = range(1, len(history['total']) + 1)
-
         plt.figure(figsize=(10, 6))
-
-        plt.plot(epochs, history['total'], label='Overall Loss', color='black', linewidth=2.5)
-        plt.plot(epochs, history['domain'], label='Domain', linestyle='--', linewidth=2)
-        plt.plot(epochs, history['bc'], label='BoundaryConditions', linestyle='-.', linewidth=2)
-        if self.isData and history['data'] and any(history['data']):
-            plt.plot(epochs, history['data'], label='LabelledData', linestyle=':', linewidth=2)
-
-        plt.yscale('log')
+        plt.plot(train_loss_history, label='Train Loss')
+        if val_loss_history:
+            plt.plot(val_loss_history, label='Val Loss')
         plt.xlabel('Epoch')
-        plt.ylabel('Loss (log scale)')
-        plt.grid(True, which="both", ls="--", alpha=0.5)
+        plt.ylabel('Loss')
+        plt.title('Training History')
         plt.legend()
-        
-        if title is None:
-            title = 'Training History - FEINN'
-        plt.title(title)
-
-        plt.tight_layout()
+        plt.yscale('log')
         plt.show()
+        
+    def predict(self, coordinates: np.ndarray = None) -> np.ndarray:
+        """
+        Predict displacements for given coordinates using the trained neural network.
+        """
+        self.nnet.eval()
+        with torch.no_grad():
+            if coordinates is None:
+                coord_t = self.coordinates_t
+            else:
+                coord_t = self._to_torch_tensor(coordinates)
+            udisp_t_2d = self.nnet(coord_t)
+            udisp_np = self._to_numpy_array(udisp_t_2d.flatten())
+        return udisp_np
