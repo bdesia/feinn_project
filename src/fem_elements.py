@@ -120,12 +120,6 @@ class QuadElement(MasterElement):
         return torch.tensor(dofs, dtype=torch.long, device=self.device)
     
     def get_nodal_coordinates(self, coordinates: np.ndarray) -> torch.Tensor:
-        ' Get nodal coordinates from global coordinate array '
-        self.X = torch.tensor([coordinates[n - 1] for n in self.nodes],
-                              dtype=torch.float64, device = self.device
-                        )       # [nnode, 2-coord]
-
-    def get_nodal_coordinates(self, coordinates: np.ndarray) -> torch.Tensor:
         ''' Get nodal coordinates from global coordinate array '''
 
         node_indices = np.array(self.nodes) - 1         # [nnode,]
@@ -136,7 +130,7 @@ class QuadElement(MasterElement):
     def reduced_integration(self) -> int:
         ' Set element to use reduced integration (1x1) '
         self.ngp = 1 if self.nnode == 4 else 2
-       
+
     def get_local_disp(self, global_disp: torch.Tensor) -> torch.Tensor:
         """ u_global: (ndof_total,) → returns (nnode, 2) """
         return global_disp[self.dofs].reshape(self.nnode, 2)    # [nnode, 2-dofs]

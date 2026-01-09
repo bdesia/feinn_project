@@ -16,7 +16,8 @@ class mFCNet(nn.Module):
                  output_dim: int = 2, 
                  num_layers: int = 6,
                  num_neurons: int = 64, 
-                 activation: nn.Module = nn.Tanh):
+                 activation: nn.Module = nn.Tanh,
+                 bias: bool = True):
         
         super(mFCNet, self).__init__()
 
@@ -28,20 +29,20 @@ class mFCNet(nn.Module):
         self.num_layers = num_layers
 
         # U and V branches: linear tranformations of the input
-        self.WU = nn.Linear(input_dim, num_neurons, bias=True)
-        self.WV = nn.Linear(input_dim, num_neurons, bias=True)
+        self.WU = nn.Linear(input_dim, num_neurons, bias=bias)
+        self.WV = nn.Linear(input_dim, num_neurons, bias=bias)
 
         # First hidden layer
-        self.WH = nn.Linear(input_dim, num_neurons, bias=True)
+        self.WH = nn.Linear(input_dim, num_neurons, bias=bias)
 
         # Hidden layers from 2 until n_layers
         self.hidden_layers = nn.ModuleList([
-            nn.Linear(num_neurons, num_neurons, bias=True)
+            nn.Linear(num_neurons, num_neurons, bias=bias)
             for _ in range(num_layers - 1) 
         ])
     
         # Output layer
-        self.out_layer = nn.Linear(num_neurons, output_dim, bias=True)
+        self.out_layer = nn.Linear(num_neurons, output_dim, bias=bias)
 
     def forward(self, x):
         """
