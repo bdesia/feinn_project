@@ -844,7 +844,6 @@ class FEINN(BaseSolver):
                  nnet_init: str = None,
                  isData: bool = False,
                  bc_weight: float = 1e4,                # Penalty weight for soft BCs
-                 force_scaler: float = 1.0,             # Scaling factor for force residuals
                  normalize_coords = True,
                  ):
 
@@ -853,7 +852,6 @@ class FEINN(BaseSolver):
         self.isData = isData
         
         self.bc_weight = bc_weight
-        self.force_scaler = force_scaler
         
         # Neural network
         self.nnet = nnet if nnet is not None else DEFAULT_NNET
@@ -875,7 +873,8 @@ class FEINN(BaseSolver):
             self._normalize_coords()
 
         self.loss_fun = nn.MSELoss()
-
+        self.loss_res0 =  self.loss_fun(self.Fext_total, torch.zeros_like(self.Fext_total))
+        
         if self.verbose:
             n_params = sum(p.numel() for p in self.nnet.parameters())
             print(f"[FEINN] Initialized with {n_params} trainable parameters")
@@ -947,7 +946,7 @@ class FEINN(BaseSolver):
         res_pred = self._forces_residual(u_pred.reshape(-1))[self.free_dofs]        # Convert u_pred to (ndof,). Retain only free dofs
         res_true = torch.zeros_like(res_pred)
 
-        loss_domain = self.loss_fun(self.force_scaler * res_pred, res_true)
+        loss_domain = self.loss_fun(res_pred, res_true) / self.loss_res0
         loss_domain.backward(retain_graph=True)
         
         # Store domain gradients
@@ -1016,7 +1015,7 @@ class FEINN(BaseSolver):
 
         res_pred = self._forces_residual(u_pred.reshape(-1))[self.free_dofs]
         res_true = torch.zeros_like(res_pred)
-        loss_domain = self.loss_fun(self.force_scaler * res_pred, res_true)
+        loss_domain = self.loss_fun(res_pred, res_true) / self.loss_res0
 
         # BC loss
         loss_bc = torch.tensor(0.0, device=self.device, dtype=torch.float64)
@@ -1155,6 +1154,9 @@ class FEINN(BaseSolver):
 
         if self.verbose:
             print(f"[FEINN] Training complete – final loss: {train_results['Overall']:.3e}")
+        
+        with torch.no_grad():
+            self.udisp = self.nnet(self.coords_tensor).reshape(-1).detach()
 
         self.history = {'loss': history}  # Store properly
         
