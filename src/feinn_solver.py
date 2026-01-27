@@ -813,9 +813,6 @@ class NFEA(BaseSolver):
             print("MAXIMUM NUMBER OF ITERATIONS REACHED - NO CONVERGENCE")
             return False
 
-# TODO: - for incremental analysis: warm-start from previous step. The NN must calculate displacements increments. Total displacements are given as u_prev + du_nn
-#       - for incremental analysis: fine-tunning from previous step. The NN must inicialize weights from previous step and then calculate total displacements u_nn
-
 
 
 DEFAULT_NNET = torch.nn.Sequential(
@@ -874,6 +871,8 @@ class FEINN(BaseSolver):
 
         self.loss_fun = nn.MSELoss()
         self.loss_res0 =  self.loss_fun(self.Fext_total, torch.zeros_like(self.Fext_total))
+        if self.loss_res0 < 1e-12:
+            self.loss_res0 = 1.0
         
         if self.verbose:
             n_params = sum(p.numel() for p in self.nnet.parameters())
@@ -883,7 +882,28 @@ class FEINN(BaseSolver):
         # === GET FREE AND FIXED DOFS ===
         self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
 
+        # === SET L-BFGS OPTIMIZER ===
+        self.lbfgs_optimizer = torch.optim.LBFGS(
+            self.nnet.parameters(),
+            lr=1.0,
+            max_iter=20,
+            history_size=100,
+            line_search_fn="strong_wolfe",
+            tolerance_grad=1e-7,
+            tolerance_change=1e-9,
+        )
+
+        self.maxit = 100        # Maximum number of iterations
+    
+        self.dtol = 1e-6        # Displacement tolerance
+        self.etol = 1e-6        # Energy tolerance 
+        self.ftol = 1e-6        # Force tolerance
+
     def warmup_zero_displacement(self, epochs=500, lr=1e-3):
+        """
+        Warmup training to initialize the neural network to output near-zero displacements.
+        This helps to start the training from a physically reasonable state.
+        """
         optimizer = torch.optim.Adam(self.nnet.parameters(), lr=lr)
         X = self.coords_tensor
         
@@ -1032,7 +1052,7 @@ class FEINN(BaseSolver):
         # Data loss
         loss_data = torch.tensor(0.0, device=self.device, dtype=torch.float64)
         if self.isData:
-            pass  # tu implementación
+            pass  #to be implemented
 
         total_loss = loss_domain + loss_bc + loss_data
         return total_loss, loss_domain, loss_bc, loss_data
@@ -1101,11 +1121,6 @@ class FEINN(BaseSolver):
                 print(f"  BC:     {train_results['BoundaryConditions']:.3e}")
                 if self.isData and 'LabelledData' in train_results:
                     print(f"  Data:   {train_results['LabelledData']:.3e}")
-                
-                # domain_norm = sum((g**2).sum() for g in grad_flow['Domain'].values() if g is not None)
-                # bc_norm = sum((g**2).sum() for g in grad_flow['BoundaryConditions'].values() if g is not None)
-                # print(f"\n  Domain grad norm: {domain_norm.item():.2e}")
-                # print(f"  BC grad norm:     {bc_norm.item():.2e}")
 
             # Store history
             history['total'].append(train_results['Overall'])
@@ -1115,7 +1130,7 @@ class FEINN(BaseSolver):
                 history['data'].append(train_results['LabelledData'])
 
         # ========================================
-        # 2nd stage: L-BFGS optimizer (optional)
+        # 2nd stage: L-BFGS optimizer
         # ========================================
         
         if lbfgs_epochs > 0:
@@ -1124,24 +1139,14 @@ class FEINN(BaseSolver):
                 total_loss, _, _, _ = self._compute_total_loss(model)
                 total_loss.backward()
                 return total_loss
-            
-            lbfgs_optimizer = torch.optim.LBFGS(
-                model.parameters(),
-                lr=1.0,
-                max_iter=20,
-                history_size=100,
-                line_search_fn="strong_wolfe",
-                tolerance_grad=1e-7,
-                tolerance_change=1e-9,
-            )
 
             for epoch in range(1, lbfgs_epochs + 1):
-                loss = lbfgs_optimizer.step(closure)
+                loss = self.lbfgs_optimizer.step(closure)
                 
                 with torch.no_grad():
                     _, loss_domain, loss_bc, loss_data = self._compute_total_loss(model)
                     
-                if verbose and (epoch == 1 or epoch % 50 == 0 or epoch == lbfgs_epochs):
+                if verbose and (epoch == 1 or epoch % 100 == 0 or epoch == lbfgs_epochs):
                     print(f"\nEpoch {epoch}/{lbfgs_epochs} (L-BFGS)")
                     print(f"Total Loss: {loss.item():.3e}")
                     print(f"  Domain: {loss_domain.item():.3e}")
@@ -1194,3 +1199,102 @@ class FEINN(BaseSolver):
 
         plt.tight_layout()
         plt.show()
+    
+    def _incremental_step(self):
+        """
+        Equivalent to the Newton-Raphson incremental step, but adapted for FEINN.
+        Uses L-BFGS optimization to minimize the loss until physical convergence criteria
+        are met, similar to displacement, force, and energetic errors in FEM.
+        """
+
+        # ----------------------------------------------------
+        # Initialization of some variables
+        # ----------------------------------------------------
+
+        err_d = [100.0]          # Initialization of displacement error
+        err_f = [100.0]          # Initialization of force residual error
+        err_e = [100.0]          # Initialization of energetic error
+
+        it = 0                  # Iteration counter
+
+        def closure():
+            self.lbfgs_optimizer.zero_grad()
+            total_loss, _, _, _ = self._compute_total_loss(self.nnet)
+            total_loss.backward()
+            return total_loss
+
+        # Initial displacement prediction (flattened for vector ops)
+        with torch.no_grad():
+            u_old = self.nnet(self.coords_tensor).flatten()
+
+        Fint = self._assemble_internal_forces()         # Internal force vector initialization
+        residual = self.Fext - Fint
+
+        # Initial residual norm (only free dofs)
+        res_norm0 = torch.norm(residual[self.free_dofs])
+        if res_norm0 < 1e-14:
+            res_norm0 = 1.0
+
+        # ----------------------------------------------------
+        # Training loop
+        # ----------------------------------------------------
+
+        while it < self.maxit:
+
+            it += 1											# Counter iteration update
+
+            # Perform one L-BFGS optimization step
+            loss = self.lbfgs_optimizer.step(closure)
+
+            # Update displacement and compute increments
+            with torch.no_grad():
+                u_new = self.nnet(self.coords_tensor).flatten()
+
+            du = u_new - u_old
+
+            self.udisp = u_new                              # Update displacement vector
+
+            Fint = self._assemble_internal_forces()         # Update internal force vector
+            residual = self.Fext - Fint                     # Update residual
+
+            # --- Convergence criteria ---
+            du_norm = torch.norm(du[self.free_dofs])
+            u_norm  = torch.norm(self.udisp[self.free_dofs])
+            res_norm = torch.norm(residual[self.free_dofs])
+
+            err_d.append(du_norm / (u_norm + 1e-12))
+            err_f.append(res_norm / res_norm0)
+
+            energy = torch.dot(du, residual)                # Energetic criterion
+            if it == 1:
+                energy0 = energy if abs(energy) > 1e-14 else 1.0
+            err_e.append(energy / energy0)
+
+            if self.verbose:
+                print(f"Iter {it:3d} | du error: {err_d[-1]:.2e}  Res error: {err_f[-1]:.2e}  Energetic error: {err_e[-1]:.2e}  Loss: {loss.item():.2e}")
+
+            # --- Check convergence ---
+            if (err_d[-1] < self.dtol and
+                err_f[-1] < self.ftol and
+                err_e[-1] < self.etol):
+                if self.verbose:
+                    print(f"Converged in {it} iterations")
+                # Store history (adapted from reference code)
+                self.history['load_factor'].append(self.load_factor)
+                self.history['displacement_error'].append(err_d[-1])
+                self.history['residual_error'].append(err_f[-1])
+                self.history['energetic_error'].append(err_e[-1])
+                self.history['iterations'].append(it)
+                return True
+
+            # --- Protection against divergence ---
+            if res_norm > 1e8 * res_norm0:
+                if self.verbose:
+                    print(f"Optimization diverged at iteration {it}")
+                return False
+
+            u_old = u_new  # Update for next iteration
+
+        else:
+            print("MAXIMUM NUMBER OF ITERATIONS REACHED - NO CONVERGENCE")
+            return False
