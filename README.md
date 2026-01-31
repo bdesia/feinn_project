@@ -43,3 +43,20 @@ Follow this steps:
     poetry env activate
     ```
 1. Now, you're ready to run the notebooks and make your own simulations.
+
+## Roadmap
+
+### 1st Part: Finite Element integrated Neural Network for Solid Mechanics
+- ✅ Torch implementation of 2D Non-linear Finite Element code
+- ✅ Neural network integration with FEM
+- ✅ Benchmark cases
+
+**BONUS**
+- ⬜ Subrrogate NN constitutive model implementation
+
+### 2nd Part: FNO for Multi-scale in Solid Mechanics
+- ✅ Strain history generation using Gaussin Process with RBF kernel.
+- ⬜ Synthethic data generation via FEM.
+- ⬜ FNO subrrogate model implementation.
+- ⬜ Integration of FNO subrrogate model into macro solver.
+- ⬜ Benchmark cases

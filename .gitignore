@@ -6,6 +6,7 @@
 /.venv
 
 # Cache y temporales
+src/__pycache__/
 __pycache__/
 *.pyc
 .pytest_cache/
