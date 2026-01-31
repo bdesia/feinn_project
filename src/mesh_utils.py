@@ -27,18 +27,18 @@ class Mesh2D:
         self.element_groups = {}                # Initialize empty element groups
     
     @staticmethod
-    def _check_element_type(element_type: str, stop=True):
+    def _check_elem_type(elem_type: str, stop=True):
         supported_types = ['quad']
-        if element_type not in supported_types:
+        if elem_type not in supported_types:
             if stop:
-                raise ValueError(f"Unsupported element type: {element_type}. Supported types: {supported_types}")
+                raise ValueError(f"Unsupported element type: {elem_type}. Supported types: {supported_types}")
             else:
                 return False
         return True
     
     @staticmethod
-    def get_edge_order(element_type: str, npe: int):
-        if element_type == 'quad':
+    def get_edge_order(elem_type: str, npe: int):
+        if elem_type == 'quad':
             if npe == 4:
                 return [0, 1, 2, 3, 0]
             elif npe == 8:
@@ -51,9 +51,9 @@ class Mesh2D:
     def add_node(self, x: float, y: float):
         self.coordinates.append(np.array[x, y])
 
-    def add_element(self, element_type: str, connectivity: np.ndarray):
-        self._check_element_type(element_type)
-        self.elements[element_type].append(connectivity)
+    def add_element(self, elem_type: str, connectivity: np.ndarray):
+        self._check_elem_type(elem_type)
+        self.elements[elem_type].append(connectivity)
 
     def get_node_coords(self, node_id: int):
         """
@@ -67,7 +67,7 @@ class Mesh2D:
         """
         return self.coordinates[node_id - 1]
 
-    def get_element_nodes(self, element_type: str, elem_id: int):
+    def get_element_nodes(self, elem_type: str, elem_id: int):
         """
         Return nodes of a specific element (1-based index).
         
@@ -78,9 +78,9 @@ class Mesh2D:
         Returns:
             ndarray: Array of node indices (1-based) for the element.
         """
-        self._check_element_type(element_type)
+        self._check_elem_type(elem_type)
         if elem_id > 0:
-            return self.elements[element_type][elem_id - 1].nodes
+            return self.elements[elem_type][elem_id - 1]
         else:
             raise ValueError("Element id must be between 1 and nelem.")
 
@@ -126,7 +126,7 @@ class Mesh2D:
         node_ids = np.where(mask)[0] + 1  
         return node_ids.tolist()
 
-    def plot(self, node_groups_to_plot=None, element_groups_to_plot=None, show_node_ids=False, show_element_ids=False, ax=None):
+    def plot(self, show_nodes=True, node_groups_to_plot=None, element_groups_to_plot=None, show_node_ids=False, show_element_ids=False, ax=None):
         """
         Plot the 2D mesh, with options to highlight node/element groups.
         
@@ -144,22 +144,31 @@ class Mesh2D:
             fig, ax = plt.subplots()
         
         # Plot all nodes
-        ax.scatter(self.coordinates[:, 0], self.coordinates[:, 1], c='black', s=20, label='Nodes')
+        if show_nodes:
+            ax.scatter(self.coordinates[:, 0], self.coordinates[:, 1], c='black', s=20, label='Nodes')
         
         # Plot elements
         etype_old = None
-        for etype, elem_nodes in self.elements.items():
-            elem_nodes -= 1  # Convert to 0-based for NumPy
+        for etype, connect_list in self.elements.items():
+            # convert to numpy array (1-based → 0-based)
+            connect = np.array(connect_list) - 1   # shape: (nelem, npe)
             
-            edge_order = self.get_edge_order(etype, len(elem_nodes[0]))
+            npe = connect.shape[1]
+            edge_order = self.get_edge_order(etype, npe)
             
-            x = self.coordinates[elem_nodes[edge_order], 0]
-            y = self.coordinates[elem_nodes[edge_order], 1]
-            ax.plot(x, y, 'b-', alpha=0.5, label=f'{etype} elements' if etype != etype_old else None)
-            if show_element_ids:
-                # Plot element ID at centroid
-                centroid = np.mean(self.coordinates[elem_nodes, :], axis=0)
-                ax.text(centroid[0], centroid[1], str(i + 1), color='blue', ha='center', va='center')
+            # Draw each element
+            for i, nodes in enumerate(connect):
+                x = self.coordinates[nodes[edge_order], 0]
+                y = self.coordinates[nodes[edge_order], 1]
+                
+                label = f'{etype} elements' if etype != etype_old else None
+                ax.plot(x, y, 'b-', alpha=0.5, linewidth=1.2, label=label)
+                etype_old = etype
+                
+                if show_element_ids:
+                    centroid = np.mean(self.coordinates[nodes], axis=0)
+                    ax.text(centroid[0], centroid[1], str(i + 1),
+                            color='blue', fontsize=8, ha='center', va='center', zorder=4)
         
         # Plot node groups with different colors
         if node_groups_to_plot:
@@ -173,14 +182,36 @@ class Mesh2D:
         # Plot element groups with different edge colors
         if element_groups_to_plot:
             colors = plt.cm.Set1(np.linspace(0, 1, len(element_groups_to_plot)))
-            for group, color in zip(element_groups_to_plot, colors):
-                if group in self.element_groups:
-                    for i in self.element_groups[group]:
-                        elem_nodes = self.get_element_nodes(element_type='quad', elem_id=i) - 1
-                        x = self.coordinates[elem_nodes[edge_order], 0]
-                        y = self.coordinates[elem_nodes[edge_order], 1]
-                        ax.plot(x, y, c=color, alpha=0.8, label=group if i == min(self.element_groups[group]) else None)
-        
+            etype = 'quad'
+            for group_name, color in zip(element_groups_to_plot, colors):
+                if group_name not in self.element_groups:
+                    continue
+                
+                elem_ids = list(self.element_groups[group_name])
+                first = True
+                
+                for elem_id in elem_ids:
+                    nodes_1based = self.get_element_nodes(elem_type=etype, elem_id=elem_id)
+                    nodes = np.array(nodes_1based) - 1
+                    
+                    npe = len(nodes)
+                    edge_order = self.get_edge_order(etype, npe)
+                    
+                    x = self.coordinates[nodes[edge_order], 0]
+                    y = self.coordinates[nodes[edge_order], 1]
+                    
+                    label = group_name if first else None
+                    
+                    # Fill group elements with color
+                    ax.fill(x, y,
+                            facecolor=color,
+                            edgecolor='black',
+                            linewidth=1.0,
+                            alpha=0.4,          # transparency
+                            label=label)
+                    
+                    first = False
+                    
         # Plot node IDs if requested
         if show_node_ids:
             for i in range(self.nnod):
@@ -229,7 +260,7 @@ class Mesh2D:
             ctypeX = cell_block.type
             ctype = next((ctypeX[:i] for i, c in enumerate(ctypeX) if c.isdigit()), ctypeX)     # Extract base type
             
-            if cls._check_element_type(ctype, stop=False):
+            if cls._check_elem_type(ctype, stop=False):
                 connectivity = cell_block.data  # (nelem, nodes_per_elem)
                 # Convert to 1-based indices
                 instance.elements[ctype] = (connectivity + 1).tolist()
@@ -312,10 +343,10 @@ class UniformQuadMesh2D(Mesh2D):
         ly (float): Length in y-direction.
         nx (int): Number of elements in x-direction.
         ny (int): Number of elements in y-direction.
-        element_type (str): Quadrilateral element type ('Q4', 'Q8', 'Q9').
+        elem_type (str): Quadrilateral element type ('Q4', 'Q8', 'Q9').
     """
     
-    def __init__(self, lx: float, ly: float, nx: int, ny: int, element_type='Q4'):
+    def __init__(self, lx: float, ly: float, nx: int, ny: int, elem_type='Q4'):
         super().__init__()
         """
         Initialize the uniform quadrilateral mesh parameters. Call compute() to generate the mesh.
@@ -325,13 +356,13 @@ class UniformQuadMesh2D(Mesh2D):
             ly (float): Length in y-direction.
             nx (int): Number of elements in x-direction.
             ny (int): Number of elements in y-direction.
-            element_type (str, optional): Element type ('Q4', 'Q8', 'Q9'). Defaults to 'Q4'.
+            elem_type (str, optional): Element type ('Q4', 'Q8', 'Q9'). Defaults to 'Q4'.
         
         Raises:
-            ValueError: If element_type is invalid or inputs are non-positive.
+            ValueError: If elem_type is invalid or inputs are non-positive.
         """
-        if element_type.upper() not in ['Q4', 'Q8', 'Q9']:
-            raise ValueError("element_type must be 'Q4', 'Q8', or 'Q9'.")
+        if elem_type.upper() not in ['Q4', 'Q8', 'Q9']:
+            raise ValueError("elem_type must be 'Q4', 'Q8', or 'Q9'.")
         if lx <= 0 or ly <= 0:
             raise ValueError("lx and ly must be positive.")
         if nx <= 0 or ny <= 0:
@@ -341,7 +372,7 @@ class UniformQuadMesh2D(Mesh2D):
         self.ly = float(ly)
         self.nx = int(nx)
         self.ny = int(ny)
-        self.element_type = element_type.upper()
+        self.elem_type = elem_type.upper()
         
     def compute(self):
         """
@@ -360,7 +391,7 @@ class UniformQuadMesh2D(Mesh2D):
         # NODES GENERATION
         # -----------------------------------------------
 
-        npe = 4 if self.element_type == 'Q4' else 8 if self.element_type == 'Q8' else 9
+        npe = 4 if self.elem_type == 'Q4' else 8 if self.elem_type == 'Q8' else 9
 
         step1 = self.lx / self.nx
         step2 = self.ly / self.ny
