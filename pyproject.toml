@@ -13,7 +13,7 @@ numpy = ">=2.3.2,<3.0.0"
 matplotlib = ">=3.10.6,<4.0.0"
 numba = "^0.62.1"
 torch = {version = "2.6.0+cpu", source = "pytorch-cpu"}
-meshio = "^5.3.5"
+meshio = {extras = ["all"], version = "^5.3.5"}
 torchinfo = "^1.8.0"
 opt-einsum = "^3.4.0"
 scipy = "^1.16.3"
