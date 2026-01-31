@@ -228,7 +228,7 @@ class Mesh2D:
             ctypeX = cell_block.type
             ctype = next((ctypeX[:i] for i, c in enumerate(ctypeX) if c.isdigit()), ctypeX)     # Extract base type
             
-            if self._check_element_type(ctype, stop=False):
+            if cls._check_element_type(ctype, stop=False):
                 connectivity = cell_block.data  # (nelem, nodes_per_elem)
                 # Convert to 1-based indices
                 instance.elements[ctype] = (connectivity + 1).tolist()
