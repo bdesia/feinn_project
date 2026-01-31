@@ -18,11 +18,6 @@ class Mesh2D:
     def __init__(self):
         """
         Initialize the mesh with coordinates and connectivity.
-        
-        Args:
-            coordinates (list or ndarray): (nnod x 2) array of node coordinates.
-            elements (list or ndarray): (nelem x nnode) array of connectivity (1-based indices).
-            ndof_by_node (int, optional): Degrees of freedom per node. Defaults to 2 for 2D.
         """
         self.coordinates = []
         self.elements = {}
@@ -31,11 +26,34 @@ class Mesh2D:
         self.node_groups = {}                   # Initialize empty node groups
         self.element_groups = {}                # Initialize empty element groups
     
+    @staticmethod
+    def _check_element_type(element_type: str, stop=True):
+        supported_types = ['quad']
+        if element_type not in supported_types:
+            if stop:
+                raise ValueError(f"Unsupported element type: {element_type}. Supported types: {supported_types}")
+            else:
+                return False
+        return True
+    
+    @staticmethod
+    def get_edge_order(element_type: str, npe: int):
+        if element_type == 'quad':
+            if npe == 4:
+                return [0, 1, 2, 3, 0]
+            elif npe == 8:
+                return [0, 4, 1, 5, 2, 6, 3, 7, 0]
+            elif npe == 9:
+                return [0, 4, 1, 5, 2, 6, 3, 7, 0]
+            else:
+                raise ValueError("Unsupported number of nodes per element for quad.")
+
     def add_node(self, x: float, y: float):
         self.coordinates.append(np.array[x, y])
 
-    def add_element(self, element: object):
-        self.elements.append(element)
+    def add_element(self, element_type: str, connectivity: np.ndarray):
+        self._check_element_type(element_type)
+        self.elements[element_type].append(connectivity)
 
     def get_node_coords(self, node_id: int):
         """
@@ -48,22 +66,24 @@ class Mesh2D:
             ndarray: [x, y] coordinates of the node.
         """
         return self.coordinates[node_id - 1]
-    
-    def get_element_nodes(self, elem_id: int):
+
+    def get_element_nodes(self, element_type: str, elem_id: int):
         """
         Return nodes of a specific element (1-based index).
         
         Args:
-            elem_id (int): Element index (1-based).
+            etype (str):    Element type.
+            elem_id (int):  Element index (1-based).
             
         Returns:
             ndarray: Array of node indices (1-based) for the element.
         """
+        self._check_element_type(element_type)
         if elem_id > 0:
-            return self.elements[elem_id - 1].nodes
+            return self.elements[element_type][elem_id - 1].nodes
         else:
             raise ValueError("Element id must be between 1 and nelem.")
-    
+
     def add_node_group(self, group_name: str, node_indices: list):
         """
         Add a group of nodes under a specified name.
@@ -79,6 +99,8 @@ class Mesh2D:
     def add_element_group(self, group_name: str, element_indices: list):
         """
         Add a group of elements under a specified name.
+        
+        Only for quad elements.
         
         Args:
             group_name (str): Name of the element group.
@@ -106,7 +128,7 @@ class Mesh2D:
 
     def plot(self, node_groups_to_plot=None, element_groups_to_plot=None, show_node_ids=False, show_element_ids=False, ax=None):
         """
-        Plot the 2D mesh using Matplotlib, with options to highlight node/element groups.
+        Plot the 2D mesh, with options to highlight node/element groups.
         
         Args:
             node_groups_to_plot (list or None): List of node group names to highlight. None for no groups.
@@ -125,12 +147,15 @@ class Mesh2D:
         ax.scatter(self.coordinates[:, 0], self.coordinates[:, 1], c='black', s=20, label='Nodes')
         
         # Plot elements
-        for i in range(self.nelem):
-            elem_nodes = self.get_element_nodes(i + 1) - 1  # Convert to 0-based for NumPy
-            edge_order = self.elements[i].edge_order
+        etype_old = None
+        for etype, elem_nodes in self.elements.items():
+            elem_nodes -= 1  # Convert to 0-based for NumPy
+            
+            edge_order = self.get_edge_order(etype, len(elem_nodes[0]))
+            
             x = self.coordinates[elem_nodes[edge_order], 0]
             y = self.coordinates[elem_nodes[edge_order], 1]
-            ax.plot(x, y, 'b-', alpha=0.5, label='Elements' if i == 0 else None)
+            ax.plot(x, y, 'b-', alpha=0.5, label=f'{etype} elements' if etype != etype_old else None)
             if show_element_ids:
                 # Plot element ID at centroid
                 centroid = np.mean(self.coordinates[elem_nodes, :], axis=0)
@@ -151,7 +176,7 @@ class Mesh2D:
             for group, color in zip(element_groups_to_plot, colors):
                 if group in self.element_groups:
                     for i in self.element_groups[group]:
-                        elem_nodes = self.get_element_nodes(i) - 1
+                        elem_nodes = self.get_element_nodes(element_type='quad', i) - 1
                         x = self.coordinates[elem_nodes[edge_order], 0]
                         y = self.coordinates[elem_nodes[edge_order], 1]
                         ax.plot(x, y, c=color, alpha=0.8, label=group if i == min(self.element_groups[group]) else None)
@@ -169,6 +194,76 @@ class Mesh2D:
         ax.legend()
         ax.set_aspect('equal')  # Ensure equal scaling for x and y axes
         return
+
+    @classmethod
+    def from_salome_med(cls, filepath: str):
+        """
+        Load a 2D mesh exported from SALOME-MECA (SMESH module) in .med format.
+        
+        Args:
+            filepath (str): Path to the .med file
+        
+        Returns:
+            Mesh2D: Populated mesh instance according to the MED file
+        """
+        import meshio
+        
+        # Read the MED file
+        m = meshio.read(filepath)
+        
+        # Basic validation: must be 2D
+        if m.points.shape[1] != 2:
+            raise ValueError("Expected 2D mesh — points must have shape (nnod, 2)")
+        
+        # Create new empty Mesh2D instance
+        instance = cls()
+        
+        # Load nodes
+        instance.coordinates = np.asarray(m.points, dtype=float)
+        instance.nnod = len(instance.coordinates)
+        
+        # Find and load 2D cell block
+        cells_found = False
+        for cell_block in m.cells:
+            ctypeX = cell_block.type
+            ctype = next((ctypeX[:i] for i, c in enumerate(ctypeX) if c.isdigit()), ctypeX)     # Extract base type
+            
+            if self._check_element_type(ctype, stop=False):
+                connectivity = cell_block.data  # (nelem, nodes_per_elem)
+                # Convert to 1-based indices
+                instance.elements[ctype] = (connectivity + 1).tolist()
+                cells_found = True
+        
+        if not cells_found:
+            raise ValueError(
+                f"No supported 2D cells found in MED file. "
+                f"Found types: {[cb.type for cb in m.cells]}. "
+            )
+        
+        # Compute total number of elements
+        instance.nelem = sum(len(connectivity) for connectivity in instance.elements.values())
+        
+        # Node groups: only existing ones
+        if m.point_sets:
+            for name, idx0 in m.point_sets.items():
+                instance.node_groups[name] = set(idx0 + 1)
+                
+        # Element groups: only existing ones (from the loaded cell block)
+        if m.cell_sets:
+            for name, blocks in m.cell_sets.items():
+                if blocks and len(blocks) > 0:
+                    idx0 = blocks[0]  # indices for first cell block
+                    if len(idx0) > 0:
+                        instance.element_groups[name] = set(idx0 + 1)
+        
+        # Summary print
+        print(f"Loaded SALOME .med mesh: {instance.nnod} nodes, {instance.nelem} elements")
+        if instance.node_groups:
+            print(f"Node groups ({len(instance.node_groups)}): {list(instance.node_groups.keys())}")
+        if instance.element_groups:
+            print(f"Element groups ({len(instance.element_groups)}): {list(instance.element_groups.keys())}")
+        
+        return instance
 
 class UniformQuadMesh2D(Mesh2D):
     """
