@@ -382,7 +382,6 @@ class QuadElement(MasterElement):
         # 2D Jacobian
         J_edge = torch.einsum('gij,jk->gik', dHrs, self.X)   # (ngp, 2, 2)
         detJ_edge = torch.norm(J_edge[:, :, 1 if param_name == 's' else 0], dim=1)  # ds or dr direction
-        print(detJ_edge)
         if torch.any(detJ_edge < 1e-12):
             raise ValueError(f"Near-singular edge Jacobian in elem {self.id}, side {side}")
         # N matrix: (n_gp_edge, 2, ndof_local)
