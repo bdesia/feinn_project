@@ -207,10 +207,11 @@ class Mesh2D:
             Mesh2D: Populated mesh instance according to the MED file
         """
         import meshio
+        from collections import defaultdict
         
         # Read the MED file
         m = meshio.read(filepath)
-        
+
         # Basic validation: must be 2D
         if m.points.shape[1] != 2:
             raise ValueError("Expected 2D mesh — points must have shape (nnod, 2)")
@@ -242,19 +243,48 @@ class Mesh2D:
         
         # Compute total number of elements
         instance.nelem = sum(len(connectivity) for connectivity in instance.elements.values())
-        
+
         # Node groups: only existing ones
-        if m.point_sets:
-            for name, idx0 in m.point_sets.items():
-                instance.node_groups[name] = set(idx0 + 1)
+        if hasattr(m, 'point_tags') and m.point_tags:
+            groups = defaultdict(set)
+            tags_array = m.point_data.get('point_tags', np.array([]))
+            
+            for tag, names in m.point_tags.items():
+                if names:
+                    nodes = np.flatnonzero(tags_array == tag) + 1
+                    for name in map(str.strip, names):
+                        groups[name] |= set(nodes)
+            
+            instance.node_groups.update(groups)
+        
+        # Element groups: only existing ones
+        groups = defaultdict(set)
+
+        if 'cell_tags' in m.cell_data_dict:
+            cell_tags_content = m.cell_data_dict['cell_tags']
+            
+            for cell_type, tags_array in cell_tags_content.items():
+                if not isinstance(tags_array, np.ndarray) or len(tags_array) == 0:
+                    continue
                 
-        # Element groups: only existing ones (from the loaded cell block)
-        if m.cell_sets:
-            for name, blocks in m.cell_sets.items():
-                if blocks and len(blocks) > 0:
-                    idx0 = blocks[0]  # indices for first cell block
-                    if len(idx0) > 0:
-                        instance.element_groups[name] = set(idx0 + 1)
+                unique_tags = np.unique(tags_array[tags_array != 0])  # ignora 0
+                
+                for tag_id in unique_tags:
+                    mask = tags_array == tag_id
+                    elems_1based = np.flatnonzero(mask) + 1
+                    
+                    # Get group name from cell_tags mapping if available
+                    group_name = f"family_{tag_id}_{cell_type}"
+                    if hasattr(m, 'cell_tags') and tag_id in m.cell_tags:
+                        value = m.cell_tags[tag_id]
+                        if isinstance(value, list) and value:
+                            group_name = value[0].strip()  # ej: 'all_s'
+                        elif isinstance(value, dict) and 'name' in value:
+                            group_name = value['name'].strip()
+                    
+                    groups[group_name].update(elems_1based)
+
+        instance.element_groups.update(groups)
         
         # Summary print
         print(f"Loaded SALOME .med mesh: {instance.nnod} nodes, {instance.nelem} elements")

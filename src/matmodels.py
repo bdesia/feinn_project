@@ -44,27 +44,27 @@ class LinearElastic(MaterialBase):
     Uses Voigt notation: strain/stress vector = [ε_xx, ε_yy, 2ε_xy].
     """
 
-    def __init__(self, EMOD: float, nu: float):
+    def __init__(self, emod: float, nu: float):
         """
         Parameters
         ----------
-        EMOD  : float
+        emod  : float
             Young's modulus (Pa).
         nu : float
             Poisson's ratio (dimensionless).
         """
-        if EMOD <= 0:
+        if emod <= 0:
             raise ValueError("Young's modulus (E) must be positive.")
         if not (-1 <= nu < 0.5):
             raise ValueError("Poisson's ratio (nu) must be in [-1, 0.5).")
 
-        self.EMOD = EMOD
+        self.emod = emod
         self.nu = nu
 
         # Pre-computed factors for plane strain constitutive matrix
-        self._factor1 = EMOD * (1 - nu) / ((1 + nu) * (1 - 2 * nu))
-        self._factor2 = EMOD * nu / ((1 + nu) * (1 - 2 * nu))
-        self.G = EMOD / (2 * (1 + nu))                     # Shear modulus
+        self._factor1 = emod * (1 - nu) / ((1 + nu) * (1 - 2 * nu))
+        self._factor2 = emod * nu / ((1 + nu) * (1 - 2 * nu))
+        self.G = emod / (2 * (1 + nu))                     # Shear modulus
 
         self.n_state = 0
         self.is_vectorized = False
@@ -122,24 +122,24 @@ class LinearElasticPlaneStress(MaterialBase):
     Uses Voigt notation: strain/stress vector = [ε_xx, ε_yy, 2ε_xy].
     """
 
-    def __init__(self, EMOD: float, nu: float):
+    def __init__(self, emod: float, nu: float):
         """
         Parameters
         ----------
-        EMOD  : float
+        emod  : float
             Young's modulus (Pa).
         nu : float
             Poisson's ratio (dimensionless).
         """
-        if EMOD <= 0:
+        if emod <= 0:
             raise ValueError("Young's modulus (E) must be positive.")
         if not (-1 <= nu < 0.5):
             raise ValueError("Poisson's ratio (nu) must be in [-1, 0.5).")
 
-        self.EMOD = EMOD
+        self.emod = emod
         self.nu = nu
 
-        self._factor1 = EMOD / (1 - nu**2)
+        self._factor1 = emod / (1 - nu**2)
 
         self.n_state = 0
         self.is_vectorized = False
