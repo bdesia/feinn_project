@@ -304,16 +304,24 @@ class Mesh2D:
                     mask = tags_array == tag_id
                     elems_1based = np.flatnonzero(mask) + 1
                     
-                    # Get group name from cell_tags mapping if available
-                    group_name = f"family_{tag_id}_{cell_type}"
+                    # Get name associated to tag_id
+                    names = []
+                    
                     if hasattr(m, 'cell_tags') and tag_id in m.cell_tags:
                         value = m.cell_tags[tag_id]
-                        if isinstance(value, list) and value:
-                            group_name = value[0].strip()  # ej: 'all_s'
+                        
+                        if isinstance(value, list):
+                            names = [str(v).strip() for v in value if v and str(v).strip()]
+                        
+                        elif isinstance(value, str):
+                            names = [value.strip()]
+                        
                         elif isinstance(value, dict) and 'name' in value:
-                            group_name = value['name'].strip()
-                    
-                    groups[group_name].update(elems_1based)
+                            names = [str(value['name']).strip()]
+
+                    # Add element to each group
+                    for group_name in names:
+                        groups[group_name].update(elems_1based)
 
         instance.element_groups.update(groups)
         
