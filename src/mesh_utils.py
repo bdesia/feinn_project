@@ -255,23 +255,16 @@ class Mesh2D:
         instance.nnod = len(instance.coordinates)
         
         # Find and load 2D cell block
-        cells_found = False
         for cell_block in m.cells:
             ctypeX = cell_block.type
             ctype = next((ctypeX[:i] for i, c in enumerate(ctypeX) if c.isdigit()), ctypeX)     # Extract base type
             
             if cls._check_elem_type(ctype, stop=False):
                 connectivity = cell_block.data  # (nelem, nodes_per_elem)
+
                 # Convert to 1-based indices
-                instance.elements[ctype] = (connectivity + 1).tolist()
-                cells_found = True
-        
-        if not cells_found:
-            raise ValueError(
-                f"No supported 2D cells found in MED file. "
-                f"Found types: {[cb.type for cb in m.cells]}. "
-            )
-        
+                instance.elements[ctype] = [row.astype(np.int32) for row in (connectivity + 1)]
+
         # Compute total number of elements
         instance.nelem = sum(len(connectivity) for connectivity in instance.elements.values())
 
