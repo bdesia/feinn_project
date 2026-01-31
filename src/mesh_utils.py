@@ -176,7 +176,7 @@ class Mesh2D:
             for group, color in zip(element_groups_to_plot, colors):
                 if group in self.element_groups:
                     for i in self.element_groups[group]:
-                        elem_nodes = self.get_element_nodes(element_type='quad', i) - 1
+                        elem_nodes = self.get_element_nodes(element_type='quad', elem_id=i) - 1
                         x = self.coordinates[elem_nodes[edge_order], 0]
                         y = self.coordinates[elem_nodes[edge_order], 1]
                         ax.plot(x, y, c=color, alpha=0.8, label=group if i == min(self.element_groups[group]) else None)
