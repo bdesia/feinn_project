@@ -156,6 +156,17 @@ class NodalLoads(dict):
         super().__setitem__(key, value)
 
 # ----------------------------------------------------------------------
+# Thickness classes
+# ----------------------------------------------------------------------
+
+class Thickness(dict):
+    """For defining thickness per element group."""
+    def __setitem__(self, key: str, value: float) -> None:
+        if not isinstance(value, (int, float)):
+            raise TypeError("Value must be a number (int or float)")
+        super().__setitem__(key, value)
+
+# ----------------------------------------------------------------------
 # Solver classes
 # ----------------------------------------------------------------------
 
@@ -165,6 +176,7 @@ class BaseSolver:
     def __init__(self,  mesh: object, 
                         bcs: BoundaryConditions, 
                         matfld: dict, 
+                        thickness: Thickness = None,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         nodal_loads: NodalLoads  = None,
@@ -183,6 +195,9 @@ class BaseSolver:
         
         Parameters (if requered)
         ----------
+        thickness: dict
+            {'group_name': thickness_value, ...}
+            Thickness by group of elements.
         body_loads: dict
             {'group_name': BodyLoad(), ...}
             Body loads by group of elements.
@@ -196,6 +211,7 @@ class BaseSolver:
         self.mesh = mesh
         self.bcs = bcs                          # Diritchlet Boundary conditions. [node_id, dof (1=u,2=v), value]  
         self.matfld = matfld                    # Where elements material properties are assigned
+        self.thickness = thickness             # Thickness per element group (if any)
         self.body_loads = body_loads            # Body forces (if any)
         self.edge_loads = edge_loads            # Surface tractions (if any)
         self.nodal_loads = nodal_loads          # Concentrated forces (if any)
@@ -222,6 +238,9 @@ class BaseSolver:
         self._assign_matfld(matfld)
         self._check_material()              # Checks if all elements have an assigned material
 
+        # === APPLY THICKNESS ===
+        self._assign_thickness()            # For plane stress problems
+
         # === INICIALIZE SOLUTION AND SOLVER DATA ===
         self.udisp = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)  # Displacement vector initialization
 
@@ -245,6 +264,23 @@ class BaseSolver:
     # ========================================
     # BASE METHODS
     # ========================================
+    
+    def _assign_thickness(self):
+        """Apply thickness to 2D finite elements."""
+        if not self.thickness:
+            return
+
+        for group_name, value in self.thickness.items():
+            if group_name not in self.mesh.element_groups:
+                print(f"[thickness] Warning: group '{group_name}' not in mesh")
+                continue
+
+            for eid in self.mesh.element_groups[group_name]:
+                elem = self.elements[eid - 1]
+                elem.thickness = value               # assign thickness to elements
+
+        if self.verbose:
+            print(f"[thickness] Applied {len(self.thickness)} thickness groups")
 
     def _reinit(self):
         self.udisp.zero_()
@@ -693,12 +729,13 @@ class NFEA(BaseSolver):
     def __init__(self,  mesh: object, 
                         bcs: BoundaryConditions, 
                         matfld: dict, 
+                        thickness: dict,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         nodal_loads: NodalLoads  = None,
                         verbose: bool = False):
         
-        super().__init__(mesh, bcs, matfld, body_loads, edge_loads, nodal_loads, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, verbose)
     
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
@@ -832,7 +869,8 @@ class FEINN(BaseSolver):
     def __init__(self, 
                  mesh: object, 
                  bcs: BoundaryConditions, 
-                 matfld: dict, 
+                 matfld: dict,
+                 thickness: dict,
                  body_loads: BodyLoads = None, 
                  edge_loads: EdgeLoads = None, 
                  nodal_loads: NodalLoads = None,
@@ -844,7 +882,7 @@ class FEINN(BaseSolver):
                  normalize_coords = True,
                  ):
 
-        super().__init__(mesh, bcs, matfld, body_loads, edge_loads, nodal_loads, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, verbose)
 
         self.isData = isData
         
