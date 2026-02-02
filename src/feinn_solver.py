@@ -180,6 +180,7 @@ class BaseSolver:
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         nodal_loads: NodalLoads  = None,
+                        formulation: str = 'infinitesimal',
                         verbose: bool = False):
         """
         Parameters (mandatory)
@@ -215,7 +216,7 @@ class BaseSolver:
         self.body_loads = body_loads            # Body forces (if any)
         self.edge_loads = edge_loads            # Surface tractions (if any)
         self.nodal_loads = nodal_loads          # Concentrated forces (if any)
-        self.formulation = 'infinitesimal'      # "infinitesimal" / "TLF"
+        self.formulation = formulation          # "infinitesimal" / "TLF"
         self.coordinates = mesh.coordinates
         self.elements = []
 
@@ -733,9 +734,10 @@ class NFEA(BaseSolver):
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         nodal_loads: NodalLoads  = None,
+                        formulation: str = 'infinitesimal',
                         verbose: bool = False):
         
-        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, formulation, verbose)
     
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
@@ -874,6 +876,7 @@ class FEINN(BaseSolver):
                  body_loads: BodyLoads = None, 
                  edge_loads: EdgeLoads = None, 
                  nodal_loads: NodalLoads = None,
+                 formulation: str = 'infinitesimal',
                  verbose: bool = False,
                  nnet: nn.Module = None,
                  nnet_init: str = None,
@@ -882,7 +885,7 @@ class FEINN(BaseSolver):
                  normalize_coords = True,
                  ):
 
-        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, formulation, verbose)
 
         self.isData = isData
         
