@@ -1176,7 +1176,7 @@ class FEINN(BaseSolver):
         
         if lbfgs_epochs > 0:
             def closure():
-                optimizer.zero_grad()
+                self.lbfgs_optimizer.zero_grad()
                 total_loss, _, _, _ = self._compute_total_loss(model)
                 total_loss.backward()
                 return total_loss
