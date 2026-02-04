@@ -28,7 +28,7 @@ class Mesh2D:
     
     @staticmethod
     def _check_elem_type(elem_type: str, stop=True):
-        supported_types = ['quad']
+        supported_types = ['quad','line']
         if elem_type not in supported_types:
             if stop:
                 raise ValueError(f"Unsupported element type: {elem_type}. Supported types: {supported_types}")
@@ -150,25 +150,26 @@ class Mesh2D:
         # Plot elements
         etype_old = None
         for etype, connect_list in self.elements.items():
-            # convert to numpy array (1-based → 0-based)
-            connect = np.array(connect_list) - 1   # shape: (nelem, npe)
-            
-            npe = connect.shape[1]
-            edge_order = self.get_edge_order(etype, npe)
-            
-            # Draw each element
-            for i, nodes in enumerate(connect):
-                x = self.coordinates[nodes[edge_order], 0]
-                y = self.coordinates[nodes[edge_order], 1]
+            if etype in ['quad','tri']:
+                # convert to numpy array (1-based → 0-based)
+                connect = np.array(connect_list) - 1   # shape: (nelem, npe)
                 
-                label = f'{etype} elements' if etype != etype_old else None
-                ax.plot(x, y, 'b-', alpha=0.5, linewidth=1.2, label=label)
-                etype_old = etype
+                npe = connect.shape[1]
+                edge_order = self.get_edge_order(etype, npe)
                 
-                if show_element_ids:
-                    centroid = np.mean(self.coordinates[nodes], axis=0)
-                    ax.text(centroid[0], centroid[1], str(i + 1),
-                            color='blue', fontsize=8, ha='center', va='center', zorder=4)
+                # Draw each element
+                for i, nodes in enumerate(connect):
+                    x = self.coordinates[nodes[edge_order], 0]
+                    y = self.coordinates[nodes[edge_order], 1]
+                    
+                    label = f'{etype} elements' if etype != etype_old else None
+                    ax.plot(x, y, 'b-', alpha=0.5, linewidth=1.2, label=label)
+                    etype_old = etype
+                    
+                    if show_element_ids:
+                        centroid = np.mean(self.coordinates[nodes], axis=0)
+                        ax.text(centroid[0], centroid[1], str(i + 1),
+                                color='blue', fontsize=8, ha='center', va='center', zorder=4)
         
         # Plot node groups with different colors
         if node_groups_to_plot:
@@ -258,7 +259,6 @@ class Mesh2D:
         for cell_block in m.cells:
             ctypeX = cell_block.type
             ctype = next((ctypeX[:i] for i, c in enumerate(ctypeX) if c.isdigit()), ctypeX)     # Extract base type
-            
             if cls._check_elem_type(ctype, stop=False):
                 connectivity = cell_block.data  # (nelem, nodes_per_elem)
 
