@@ -1,17 +1,144 @@
 
 import numpy as np
 import torch
-from fem_utils import QuadShapeFunctions, QuadShapeDerivatives, GaussQuad
+from fem_utils import LineShapeDerivatives, LineShapeFunctions, QuadShapeFunctions, QuadShapeDerivatives, GaussQuad
 from typing import Tuple
 
 class MasterElement:
     ' Base class for master finite elements'
 
-    def __init__(self, id, nodes, material = None):
+    def __init__(self, id, nodes, material = None, device='cpu'):
         self.id = id                                                            # Element ID   
         self.nodes = nodes                                                      # List of nodes 
         self.material = material                                                # Material object
+        self.device = device
 
+        self.nnode = len(nodes)                                                 # Number of nodes
+        self.ndof_local = self.nnode * 2                                        # Number of local dofs
+        self.dofs = self._get_dof_indices()                                     # Local dof indices in global system
+
+    def _get_dof_indices(self):
+        dofs = []
+        for node in self.nodes:
+            dofs.extend([2 * (node - 1), 2 * (node - 1) + 1])
+        return torch.tensor(dofs, dtype=torch.long, device=self.device)
+    
+    def get_nodal_coordinates(self, coordinates: np.ndarray) -> torch.Tensor:
+        ''' Get nodal coordinates from global coordinate array '''
+
+        node_indices = np.array(self.nodes) - 1         # [nnode,]
+        nodal_coords_np = coordinates[node_indices]     # Shape: (nnode, 2)
+        self.X = torch.tensor(nodal_coords_np, dtype=torch.float64, device=self.device) 
+        return self.X 
+       
+    def reduced_integration(self) -> None:
+        ' Set element to use reduced integration'
+        self.ngp -= 1
+
+    def get_local_disp(self, global_disp: torch.Tensor) -> torch.Tensor:
+        """ u_global: (ndof_total,) → returns (nnode, 2) """
+        return global_disp[self.dofs].reshape(self.nnode, 2)    # [nnode, 2-dofs]
+
+    def _vectorized_gauss_points(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            """ Returns r, s, w for all ngp² points, shape (ngp²,) """
+            gp1d, w1d = GaussQuad(self.ngp)
+            gp1d = gp1d.to(self.device)
+            w1d = w1d.to(self.device)
+
+            r, s = torch.meshgrid(gp1d, gp1d, indexing='ij')
+            r = r.flatten()   # (ngp²,)
+            s = s.flatten()
+            w = torch.outer(w1d, w1d).flatten()   # (ngp²,)
+
+            return r, s, w
+
+
+class LineElement(MasterElement):
+    """
+    Line element in 2D for load computation (e.g., distributed loads).
+    Supports 2, 3, or 4 nodes.
+    """
+    def __init__(self, id: int, nodes: list, material=None, device='cpu'):
+        super().__init__(id, nodes, material, device)
+
+        if self.nnode not in [2, 3, 4]:
+            raise ValueError("Unsupported number of nodes. Supported: 2, 3, 4")
+        self.ngp = 2 if self.nnode == 2 else 3                                  # Number of Gauss points (default full integration)
+
+        # Define element node order for plotting edges
+        if self.nnode == 2:
+            self.edge_order = [0, 1]            # SEG2 element: start node, end node
+        elif self.nnode == 3:
+            self.edge_order = [0, 2, 1]         # SEG3 element: start, middle, end
+        elif self.nnode == 4:
+            self.edge_order = [0, 1, 2, 3]      # SEG4 element: start, internal1, internal2, end (corrected for standard ordering)
+
+    def compute_jacobian(self, r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:   
+        """
+        Compute Jacobian at given points r.
+
+        Args:
+            r (torch.Tensor): Natural coordinates of shape (ngp,)
+
+        Returns:
+            J (torch.Tensor): Jacobian vectors of shape (ngp, 2)
+            detJ (torch.Tensor): Jacobian determinants of shape (ngp,)
+        """
+        dHr = LineShapeDerivatives(r, self.nnode).squeeze(-2)   # [ngp, nnode] (squeeze singleton dim)
+        J = torch.einsum('gn,nj->gj', dHr, self.X)              # (ngp, 2)
+        detJ = torch.norm(J, dim=-1)                            # (ngp,)
+        if (detJ < 1e-10).any():
+            bad = torch.where(detJ < 1e-10)[0]
+            raise ValueError(f"Non-positive Jacobian in line element {self.id} at GPs {bad.tolist()}")
+
+        return J, detJ   # J (ngp, 2), detJ (ngp)
+    
+    def compute_line_load(self, flin: torch.Tensor, reference: str = 'local') -> torch.Tensor:
+        """
+        Compute equivalent nodal forces due to distributed line load (force per unit length).
+        
+        Args:
+            flin (torch.Tensor): Load vector of shape (2,) [fx, fy]
+                If reference='local': fx=axial (tangent), fy=transversal (normal, 90° CCW)
+                If reference='global': fx=global X, fy=global Y
+            reference (str): 'local' or 'global' (default: 'local')
+
+        Returns:
+            Fline (torch.Tensor): Local force vector of shape (ndof_local,)
+        """
+        if reference not in ['local', 'global']:
+            raise ValueError("reference must be 'local' or 'global'")
+
+        # Gauss points on the line
+        gpoint, weight = GaussQuad(self.ngp)
+        gpoint = gpoint.to(self.device)
+        weight = weight.to(self.device)
+
+        # Shape functions (pass dummy s=0 since unused in LineShapeFunctions)
+        H = LineShapeFunctions(gpoint, torch.zeros_like(gpoint), self.nnode)   # [ngp, nnode]
+
+        # Jacobian at Gauss points
+        J, detJ = self.compute_jacobian(gpoint)      # J: [ngp, 2], detJ: [ngp]
+
+        # Compute traction at each GP
+        if reference == 'local':
+            t_gp = J / detJ.unsqueeze(-1)            # Unit tangent at each GP: [ngp, 2]
+            n_gp = torch.stack([-t_gp[:, 1], t_gp[:, 0]], dim=-1)  # Unit normal (90° CCW rotation): [ngp, 2]
+            ft, fn = flin[0], flin[1]
+            traction_gp = ft * t_gp + fn * n_gp      # [ngp, 2]
+        else:
+            traction_gp = flin.unsqueeze(0).repeat(self.ngp, 1)  # Constant in global: [ngp, 2]
+
+        # N matrix: (ngp, 2, ndof_local)
+        N_edge = torch.zeros(self.ngp, 2, self.ndof_local, dtype=torch.float64, device=self.device)
+        N_edge[:, 0, 0::2] = H  # ux components
+        N_edge[:, 1, 1::2] = H  # uy components
+
+        # Integration: ∫ N^T t ds = sum_gp N^T @ traction_gp * w * detJ
+        Fline = torch.einsum('gji, gj, g -> i',
+                             N_edge, traction_gp, weight * detJ)
+
+        return Fline
 
 class QuadElement(MasterElement):
     """
@@ -20,18 +147,10 @@ class QuadElement(MasterElement):
     and geometrically linear analysis.
     """
     def __init__(self, id: int, nodes: list, material= None, thickness=1.0, device='cpu'):
-        super().__init__(id, nodes, material)
-        self.id = id                                                            # Element ID   
-        self.nodes = nodes                                                      # List of nodes connectivity
-        self.material = material                                                # Material object: could be defined later
+        super().__init__(id, nodes, material, device)
         self.thickness = thickness                                              # Element thickness (just in case of 2D plane stress)
-        self.device = device
 
-        self.nnode = len(nodes)                                                 # Number of nodes
         self.ngp = 2 if self.nnode == 4 else 3                                  # Number of Gauss points 
-        self.ndof_local = self.nnode * 2                                        # Number of local dofs
-
-        self.dofs = self._get_dof_indices()                                     # Local dof indices in global system
 
         # Define element node order for plotting edges
         if self.nnode == 4:
@@ -40,7 +159,6 @@ class QuadElement(MasterElement):
             self.edge_order = [0, 4, 1, 5, 2, 6, 3, 7, 0]  # Q8: top-right, mid-top, top-left, mid-left, ...
         elif self.nnode == 9:
             self.edge_order = [0, 4, 1, 5, 2, 6, 3, 7, 0]  # Q9: same as Q8 for edges, center node (8) ignored
-
 
 
     # --------------------------------------
@@ -112,41 +230,6 @@ class QuadElement(MasterElement):
 
     # def rotate_order(self, sense='clockwise', delta_pos=1):
     #     pass
-
-    def _get_dof_indices(self):
-        dofs = []
-        for node in self.nodes:
-            dofs.extend([2 * (node - 1), 2 * (node - 1) + 1])
-        return torch.tensor(dofs, dtype=torch.long, device=self.device)
-    
-    def get_nodal_coordinates(self, coordinates: np.ndarray) -> torch.Tensor:
-        ''' Get nodal coordinates from global coordinate array '''
-
-        node_indices = np.array(self.nodes) - 1         # [nnode,]
-        nodal_coords_np = coordinates[node_indices]     # Shape: (nnode, 2)
-        self.X = torch.tensor(nodal_coords_np, dtype=torch.float64, device=self.device) 
-        return self.X
-
-    def reduced_integration(self) -> int:
-        ' Set element to use reduced integration (1x1) '
-        self.ngp = 1 if self.nnode == 4 else 2
-
-    def get_local_disp(self, global_disp: torch.Tensor) -> torch.Tensor:
-        """ u_global: (ndof_total,) → returns (nnode, 2) """
-        return global_disp[self.dofs].reshape(self.nnode, 2)    # [nnode, 2-dofs]
-
-    def _vectorized_gauss_points(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            """ Returns r, s, w for all ngp² points, shape (ngp²,) """
-            gp1d, w1d = GaussQuad(self.ngp)
-            gp1d = gp1d.to(self.device)
-            w1d = w1d.to(self.device)
-
-            r, s = torch.meshgrid(gp1d, gp1d, indexing='ij')
-            r = r.flatten()   # (ngp²,)
-            s = s.flatten()
-            w = torch.outer(w1d, w1d).flatten()   # (ngp²,)
-
-            return r, s, w
 
     def compute_jacobian(self, r: torch.tensor, s: torch.tensor):   
         dHrs = QuadShapeDerivatives(r, s, self.nnode)   # [ngp², 2, nnode]

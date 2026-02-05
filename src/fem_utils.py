@@ -2,13 +2,107 @@
 import torch
 from typing import Tuple
 
+def LineShapeFunctions(r: torch.tensor, s: torch.tensor, nnode: int) -> torch.tensor:
+    """
+    1D Segment Lagrangian Finite Element Shape Functions
+
+    Parameters:
+        r      : torch.Tensor  (..., )   natural coordinate r ∈ [-1, 1]
+        nnode  : int                     2 (SEG2), 3 (SEG3) o 4 (SEG4)
+
+    Returns:
+        H      : torch.Tensor  (..., nnode)  shape functions evaluated at (r)
+    """
+    torch.set_default_dtype(torch.float64)
+
+    if nnode == 2: # Linear element
+
+        #	(-1)	1--------2 (+1)
+
+        H = 0.5 * torch.stack([
+            (1 + r),   # N1
+            (1 - r),   # N2
+        ], dim=-1)
+
+    elif nnode == 3:  # Quadratic element
+
+        #	1----3----2
+        #	(-1) (0)  (+1)
+
+        H = torch.stack([
+            (r**2 - r) / 2,   # N1
+            (r**2 + r) / 2,   # N2
+            1 - r**2          # N3
+        ], dim=-1)
+
+    elif nnode == 4:  # Cubic element
+
+        #	1----2----3----4
+        #	(-1) (-1/3)(1/3)(+1)
+
+        b = 1.0 / 3
+        r2 = r**2
+        r2_b2 = r2 - b * b
+
+        H = torch.stack([
+            -(9 / 16) * (r - 1) * r2_b2,         # N1
+            (27 / 16) * (r2 - 1) * (r - b),      # N2
+            (27 / 16) * (r2 - 1) * (r + b),      # N3
+            (9 / 16) * (r + 1) * r2_b2           # N4
+        ], dim=-1)
+
+    else:
+        raise ValueError("Unsupported number of nodes. Supported: 2, 3, 4")
+    return H
+
+def LineShapeDerivatives(r: torch.Tensor, nnode: int) -> torch.Tensor:
+    """
+    Derivatives of line shape functions ∂N/∂r
+
+    Returns:
+        dHr : torch.Tensor  (..., 1, nnode)
+               dHr[..., 0, :] = ∂N/∂r
+    """
+
+    torch.set_default_dtype(torch.float64)
+
+    batch_shape = r.shape
+    device = r.device
+
+    if nnode == 2:
+        dHr = torch.zeros(*batch_shape, 2, device=device)
+        dHr[..., 0] = -0.5 * torch.ones_like(r)
+        dHr[..., 1] = 0.5 * torch.ones_like(r)
+
+    elif nnode == 3:
+        dHr = torch.zeros(*batch_shape, 3, device=device)
+        dHr[..., 0] = r - 0.5
+        dHr[..., 1] = r + 0.5
+        dHr[..., 2] = -2 * r
+
+    elif nnode == 4:
+        dHr = torch.zeros(*batch_shape, 4, device=device)
+
+        b = 1.0 / 3
+        r2 = r**2
+
+        dHr[..., 0] = - (27 / 16) * r2 + (9 / 8) * r + 1 / 16
+        dHr[..., 1] = (81 / 16) * r2 - (9 / 8) * r - 27 / 16
+        dHr[..., 2] = (81 / 16) * r2 + (9 / 8) * r - 27 / 16
+        dHr[..., 3] = (27 / 16) * r2 + (9 / 8) * r - 1 / 16
+
+    else:
+        raise ValueError("Unsupported number of nodes. Supported: 2, 3, 4")
+
+    return dHr
+
 def QuadShapeFunctions(r: torch.tensor, s: torch.tensor, nnode: int) -> torch.tensor:
     """
     2D Quadrilateral Lagrangian Finite Element Shape Functions
 
     Parameters:
-        r      : torch.Tensor  (..., )   natural coordinate ξ ∈ [-1, 1]
-        s      : torch.Tensor  (..., )   natural coordinate η ∈ [-1, 1]
+        r      : torch.Tensor  (..., )   natural coordinate r ∈ [-1, 1]
+        s      : torch.Tensor  (..., )   natural coordinate s ∈ [-1, 1]
         nnode  : int                    4 (Q4), 8 (Q8) o 9 (Q9)
 
     Returns:
@@ -179,7 +273,6 @@ def QuadShapeDerivatives(r: torch.Tensor, s: torch.Tensor, nnode: int) -> torch.
         raise ValueError("Unsupported number of nodes. Supported: 4, 8, 9")
 
     return dHrs  # (..., 2, nnode)
-
 
 def GaussQuad(ngp: int) -> Tuple[torch.Tensor, torch.Tensor]:
 

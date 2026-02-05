@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
-from fem_elements import QuadElement
+from fem_elements import LineElement, QuadElement
 
 # ----------------------------------------------------------------------
 # Boundary Conditions classes
@@ -121,6 +121,53 @@ class EdgeLoads(dict):
         super().__setitem__(key, value)
 
 # ----------------------------------------------------------------------
+# Line Loads classes
+# ----------------------------------------------------------------------
+
+@dataclass(slots=True, frozen=True)
+class LineLoad:
+    """
+    Line load applied to a specific 1D element.
+
+    Attributes
+    ----------
+    fx : float
+        X-component of the line load (force per unit length)
+    fy : float
+        Y-component of the line load (force per unit length)
+    reference : str
+        'local'  - components are given in the element local system
+        'global' - components are given in the global X-Y system
+    """
+
+    fx: float
+    fy: float
+    reference: str = "local"
+
+    def __post_init__(self) -> None:
+        if self.reference not in {"local", "global"}:
+            raise ValueError(
+                f"Invalid reference '{self.reference}'. Must be 'local' or 'global'."
+            )
+
+    @property
+    def vector(self) -> np.ndarray:
+        """Return the load as a NumPy array [fx, fy]."""
+        return np.array([self.fx, self.fy], dtype=float)
+    
+    @property
+    def tensor(self) -> torch.tensor:
+        """Return the load as a Torch tensor [fx, fy]."""
+        return torch.tensor([self.fx, self.fy], dtype=torch.float64)
+    
+class LineLoads(dict):
+    """Only accepts LineLoad objects."""
+    def __setitem__(self, key: str, value: LineLoad) -> None:
+        if not isinstance(value, LineLoad):
+            raise TypeError("Value must be an instance of LineLoad")
+        super().__setitem__(key, value)
+
+# ----------------------------------------------------------------------
 # Nodal Loads classes
 # ----------------------------------------------------------------------
 
@@ -179,6 +226,7 @@ class BaseSolver:
                         thickness: Thickness = None,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
+                        line_loads: LineLoads  = None,
                         nodal_loads: NodalLoads  = None,
                         formulation: str = 'infinitesimal',
                         verbose: bool = False):
@@ -205,6 +253,9 @@ class BaseSolver:
         edge_loads: dict
             {'group_name': EdgeLoad(), ...}
             Edge loads by group of elements.
+        line_loads: dict
+            {'group_name': LineLoad(), ...}
+            Line loads by group of elements.
         nodal_loads: dict
             {'group_name': NodalLoad(), ...}
             Nodal loads by group of nodes.   
@@ -215,10 +266,12 @@ class BaseSolver:
         self.thickness = thickness             # Thickness per element group (if any)
         self.body_loads = body_loads            # Body forces (if any)
         self.edge_loads = edge_loads            # Surface tractions (if any)
+        self.line_loads = line_loads            # Line loads (if any)
         self.nodal_loads = nodal_loads          # Concentrated forces (if any)
         self.formulation = formulation          # "infinitesimal" / "TLF"
         self.coordinates = mesh.coordinates
         self.elements = []
+        self.line_elements = []
 
         self.verbose = verbose
 
@@ -229,6 +282,12 @@ class BaseSolver:
             for element_index, quad_connectivity in enumerate(mesh.elements['quad']):
                 self.elements.append(QuadElement(element_index + 1, quad_connectivity))
                 self.elements[element_index].get_nodal_coordinates(self.coordinates)
+
+        if 'line' in mesh.elements.keys():
+            for element_index, line_connectivity in enumerate(mesh.elements['line']):
+                self.line_elements.append(LineElement(element_index + 1, line_connectivity))
+                self.line_elements[element_index].get_nodal_coordinates(self.coordinates)
+                
 
         # === MESH ATTRIBUTES ===
         self.nnod = mesh.nnod               # Number of nodes
@@ -249,6 +308,7 @@ class BaseSolver:
         self.Fext_total = torch.zeros_like(self.udisp)
         self._apply_body_loads()
         self._apply_edge_loads()
+        self._apply_line_loads()
         self._apply_nodal_loads()
 
         # Current state
@@ -458,6 +518,27 @@ class BaseSolver:
 
         if self.verbose:
             print(f"[edge_load] Applied {len(self.edge_loads)} edge load groups")
+
+    def _apply_line_loads(self):
+        """Apply line loads."""
+        if not self.line_loads:
+            return
+
+        for group_name, load in self.line_loads.items():
+            if group_name not in self.mesh.element_groups:
+                print(f"[line_load] Warning: group '{group_name}' not in mesh")
+                continue
+
+            for eid in self.mesh.element_groups[group_name]:
+                elem = self.line_elements[eid - 1]
+                f_edge = elem.compute_line_load(
+                    load.tensor, load.reference
+                )
+                dofs = elem.dofs
+                self.Fext_total[dofs] += f_edge
+
+        if self.verbose:
+            print(f"[line_load] Applied {len(self.line_loads)} line load groups")
 
     def _apply_nodal_loads(self):
         """Apply concentrated nodal loads.
@@ -733,11 +814,12 @@ class NFEA(BaseSolver):
                         thickness: dict,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
+                        line_loads: LineLoads  = None,
                         nodal_loads: NodalLoads  = None,
                         formulation: str = 'infinitesimal',
                         verbose: bool = False):
         
-        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, formulation, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, line_loads, nodal_loads, formulation, verbose)
     
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
@@ -875,6 +957,7 @@ class FEINN(BaseSolver):
                  thickness: dict,
                  body_loads: BodyLoads = None, 
                  edge_loads: EdgeLoads = None, 
+                 line_loads: LineLoads  = None,
                  nodal_loads: NodalLoads = None,
                  formulation: str = 'infinitesimal',
                  verbose: bool = False,
@@ -885,7 +968,7 @@ class FEINN(BaseSolver):
                  normalize_coords = True,
                  ):
 
-        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, nodal_loads, formulation, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, line_loads, nodal_loads, formulation, verbose)
 
         self.isData = isData
         
