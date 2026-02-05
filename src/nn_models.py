@@ -101,8 +101,8 @@ class FCResBlock(nn.Module):
 
 class FCResNet(nn.Module):
     """Fully Connected Residual Network (ResNet MLP-style)"""
-    def __init__(self, num_blocks: int = 6, 
-                 num_layers_: int = 4,          # per block...
+    def __init__(self, num_blocks: int = 4, 
+                 num_layers_: int = 12,          # per block...
                  num_neurons: int = 64, 
                  activation: nn.Module = nn.Tanh):
         
