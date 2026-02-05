@@ -1013,7 +1013,7 @@ class FEINN(BaseSolver):
             max_iter=20,
             history_size=100,
             line_search_fn="strong_wolfe",
-            tolerance_grad=1e-7,
+            tolerance_grad=1e-10,           # default 1e-7
             tolerance_change=1e-9,
         )
 
