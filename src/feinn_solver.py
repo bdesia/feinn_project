@@ -992,11 +992,6 @@ class FEINN(BaseSolver):
             self.coordinates, dtype=torch.float64, device=self.device)  # (nnod, 2)
         if normalize_coords:
             self._normalize_coords()
-
-        self.loss_fun = nn.MSELoss()
-        self.loss_res0 =  self.loss_fun(self.Fext_total, torch.zeros_like(self.Fext_total))
-        if self.loss_res0 < 1e-12:
-            self.loss_res0 = 1.0
         
         if self.verbose:
             n_params = sum(p.numel() for p in self.nnet.parameters())
@@ -1005,6 +1000,12 @@ class FEINN(BaseSolver):
 
         # === GET FREE AND FIXED DOFS ===
         self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
+
+        self.loss_fun = nn.MSELoss()
+        res0 = self.Fext_total[self.free_dofs]
+        self.loss_res0 =  self.loss_fun(res0, torch.zeros_like(res0))
+        if self.loss_res0 < 1e-12:
+            self.loss_res0 = 1.0
 
         # === SET L-BFGS OPTIMIZER ===
         self.lbfgs_optimizer = torch.optim.LBFGS(
