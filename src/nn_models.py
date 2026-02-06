@@ -42,7 +42,7 @@ class mFCNet(nn.Module):
         ])
     
         # Output layer
-        self.out_layer = nn.Linear(num_neurons, output_dim, bias=bias)
+        self.out_layer = nn.Linear(num_neurons, output_dim, bias=False)
 
     def forward(self, x):
         """

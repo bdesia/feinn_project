@@ -1040,9 +1040,7 @@ class FEINN(BaseSolver):
             loss_zero.backward()
             optimizer.step()
             
-            if (epoch+1) % 100 == 0 and self.verbose:
-                print(f"Warmup epoch {epoch+1}/{epochs} - zero loss: {loss_zero.item():.2e}")
-        
+        print(f"Warmup loss: {loss_zero.item():.2e}")
         print("[FEINN] Warmup completado - salida inicial ≈ 0")
 
     @staticmethod
@@ -1071,86 +1069,6 @@ class FEINN(BaseSolver):
     def _forces_residual(self, u: torch.Tensor) -> torch.Tensor:
         Fint = self._assemble_internal_forces(u)
         return self.Fext_total - Fint                 
-
-    def train_one_epoch2(self, model, optimizer, scheduler=None):
-
-        model.train()
-        optimizer.zero_grad()
-        
-        loss_list = []
-        tag_keys = []
-        
-        grad_flow = {'Domain': {}, 'BoundaryConditions': {}}
-
-        # =============================
-        # Domain loss (PDE residual)
-        # =============================
-        X_domain = self.coords_tensor                   # All nodes contribute to residual
-        u_pred = model(X_domain)                        # (nnod, 2)              
-
-        res_pred = self._forces_residual(u_pred.reshape(-1))[self.free_dofs]        # Convert u_pred to (ndof,). Retain only free dofs
-        res_true = torch.zeros_like(res_pred)
-
-        loss_domain = self.loss_fun(res_pred, res_true) / self.loss_res0
-        loss_domain.backward(retain_graph=True)
-        
-        # Store domain gradients
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_flow['Domain'][name] = param.grad.clone().detach()
-        
-        loss_list.append(loss_domain.detach())
-        tag_keys.append('Domain')
-
-        # =============================
-        # Soft Dirichlet BCs
-        # =============================
-        loss_bc = torch.tensor(0.0, device=self.device)
-        bc_data = self._get_dirichlet_bc_data()
-
-        if bc_data:
-            nodes = torch.cat([bc['nodes_0'] for bc in bc_data])
-            dofs  = torch.cat([bc['dofs']      for bc in bc_data])
-            u_true  = torch.cat([bc['values']    for bc in bc_data])
-
-            u_pred_bc = model(self.coords_tensor[nodes])
-            u_pred_bc = u_pred_bc[torch.arange(len(u_true)), dofs % 2]
-
-            loss_bc = self.bc_weight * self.loss_fun(u_pred_bc, u_true)
-            loss_bc.backward(retain_graph=True)
-
-            # Store BC-only contribution: current grad minus previous (domain) grad
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_bc_only = param.grad.clone().detach() - grad_flow['Domain'].get(name, torch.zeros_like(param.grad))
-                    grad_flow['BoundaryConditions'][name] = grad_bc_only
-
-        loss_list.append(loss_bc.detach().clone())
-        tag_keys.append('BoundaryConditions')
-
-        # =============================
-        # Labelled Data (if available)
-        # =============================
-        loss_data = torch.tensor(0.0, device=self.device)
-        if self.isData:
-            # Placeholder: implement if you have supervised data
-            pass
-        loss_list.append(loss_data)
-        tag_keys.append('LabelledData')
-
-        # =============================
-        # Total loss
-        # =============================
-        total_loss = loss_domain + loss_bc + loss_data
-        loss_list.append(total_loss.detach())
-        tag_keys.append('Overall')
-        
-        # Optimization step
-        optimizer.step()
-        if scheduler is not None:
-            scheduler.step()
-
-        return dict(zip(tag_keys, loss_list)), grad_flow
 
     def _compute_total_loss(self, model: nn.Module) -> torch.Tensor:
         
@@ -1267,21 +1185,31 @@ class FEINN(BaseSolver):
 
             for epoch in range(1, lbfgs_epochs + 1):
                 loss = self.lbfgs_optimizer.step(closure)
-                
+
                 with torch.no_grad():
-                    _, loss_domain, loss_bc, loss_data = self._compute_total_loss(model)
+                    total_loss, loss_domain, loss_bc, loss_data = self._compute_total_loss(model)
                     
-                if verbose and (epoch == 1 or epoch % 100 == 0 or epoch == lbfgs_epochs):
+                if verbose and (epoch == 1 or epoch % 10 == 0 or epoch == lbfgs_epochs):
                     print(f"\nEpoch {epoch}/{lbfgs_epochs} (L-BFGS)")
-                    print(f"Total Loss: {loss.item():.3e}")
+                    print(f"Total Loss: {total_loss.item():.3e}")
                     print(f"  Domain: {loss_domain.item():.3e}")
                     print(f"  BC:     {loss_bc.item():.3e}")
 
-                history['total'].append(loss.item())
+                history['total'].append(total_loss.item())
                 history['domain'].append(loss_domain.item())
                 history['bc'].append(loss_bc.item())
                 history['data'].append(loss_data.item() if self.isData else 0.0)
 
+                if epoch == lbfgs_epochs:
+                    all_grads = [
+                    p.grad.abs().max().item() 
+                    for p in model.parameters() 
+                    if p.grad is not None
+                    ]
+
+                    max_g = max(all_grads)
+                    print(f" Maximum gradient (Inf-Norm): {max_g:.2e}")
+                    
         if self.verbose:
             print(f"[FEINN] Training complete – final loss: {train_results['Overall']:.3e}")
         
