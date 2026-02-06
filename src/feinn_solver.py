@@ -360,16 +360,8 @@ class BaseSolver:
         Assigns material to elements based on element groups.
         Group 'all' is used as default (fallback).
         """
-        if 'all' not in matfld:
-            raise ValueError("Group 'all' is MANDATORY in matfld")
-
-        default_material = matfld['all']
-        for elem in self.elements:
-            elem.material = default_material  # Default: 'all'
 
         for group_name, material in matfld.items():
-            if group_name == 'all':
-                continue
             if group_name not in self.mesh.element_groups:
                 print(f"[matfld] Warning: group '{group_name}' does not exist in mesh")
                 continue
@@ -811,7 +803,7 @@ class NFEA(BaseSolver):
     def __init__(self,  mesh: object, 
                         bcs: BoundaryConditions, 
                         matfld: dict, 
-                        thickness: dict,
+                        thickness: Thickness = None,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         line_loads: LineLoads  = None,
@@ -953,8 +945,8 @@ class FEINN(BaseSolver):
     def __init__(self, 
                  mesh: object, 
                  bcs: BoundaryConditions, 
-                 matfld: dict,
-                 thickness: dict,
+                 matfld: dict, 
+                 thickness: Thickness = None,
                  body_loads: BodyLoads = None, 
                  edge_loads: EdgeLoads = None, 
                  line_loads: LineLoads  = None,
