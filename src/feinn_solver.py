@@ -311,6 +311,9 @@ class BaseSolver:
         self._apply_line_loads()
         self._apply_nodal_loads()
 
+        # === GET FREE AND FIXED DOFS ===
+        self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
+        
         # Current state
         self.load_factor = 0.0                              # Current λ (0 ≤ λ ≤ 1 or more)
         self.Fext = torch.zeros_like(self.udisp)            # Current external load = λ * Fext_total
@@ -774,27 +777,6 @@ class BaseSolver:
 
             return
 
-    # def export_resu(
-    #     self,
-    #     filename: str | PathLike,
-    #     nodal_data: Dict[str, Tensor] = {},
-    #     elem_data: Dict[str, List[Tensor]] = {},
-    #       ):
-    #     from meshio import Mesh, read
-    #     etype = mesh.etype.meshio_type
-
-    #     msh = Mesh(
-    #         points=model.coordinates.cpu().detach(),
-    #         cells={etype: model.connectivity.cpu().detach()},
-    #         point_data={key: tensor.cpu().detach() for key, tensor in nodal_data.items()},
-    #         cell_data={
-    #             key: [tensor.cpu().detach() for tensor in tensor_list]
-    #             for key, tensor_list in elem_data.items()
-    #         },
-    #     )
-    #     msh.write(filename)
-
-    # export_mesh(model, "result.vtu", elem_data={"rho": [rho[-1]]})
 
 class NFEA(BaseSolver):
     """
@@ -818,9 +800,6 @@ class NFEA(BaseSolver):
         self.ftol = 1e-6        # Force tolerance
 
         self.maxit = 20         # Maximum number of iterations
-
-        # === APPLY DIRICHLET BOUNDARY CONDITIONS ===
-        self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
 
     def _assemble_stiffness(self)-> torch.Tensor:
         """
@@ -989,9 +968,6 @@ class FEINN(BaseSolver):
             n_params = sum(p.numel() for p in self.nnet.parameters())
             print(f"[FEINN] Initialized with {n_params} trainable parameters")
             print(f"[FEINN] Soft Dirichlet BC enforcement (weight = {self.bc_weight:.1e})")
-
-        # === GET FREE AND FIXED DOFS ===
-        self.fixed_dofs, self.free_dofs = self._apply_dirichlet_bcs()
 
         self.loss_fun = nn.MSELoss()
         res0 = self.Fext_total[self.free_dofs]
