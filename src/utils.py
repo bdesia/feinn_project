@@ -2,7 +2,7 @@
 import torch
 from typing import Tuple
 
-def LineShapeFunctions(r: torch.tensor, s: torch.tensor, nnode: int) -> torch.tensor:
+def LineShapeFunctions(r: torch.tensor, nnode: int) -> torch.tensor:
     """
     1D Segment Lagrangian Finite Element Shape Functions
 

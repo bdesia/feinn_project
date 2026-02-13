@@ -1,7 +1,7 @@
 
 import numpy as np
 import torch
-from fem_utils import LineShapeDerivatives, LineShapeFunctions, QuadShapeFunctions, QuadShapeDerivatives, GaussQuad
+from utils import LineShapeDerivatives, LineShapeFunctions, QuadShapeFunctions, QuadShapeDerivatives, GaussQuad
 from typing import Tuple
 
 class MasterElement:
@@ -115,7 +115,7 @@ class LineElement(MasterElement):
         weight = weight.to(self.device)
 
         # Shape functions (pass dummy s=0 since unused in LineShapeFunctions)
-        H = LineShapeFunctions(gpoint, torch.zeros_like(gpoint), self.nnode)   # [ngp, nnode]
+        H = LineShapeFunctions(gpoint, self.nnode)   # [ngp, nnode]
 
         # Jacobian at Gauss points
         J, detJ = self.compute_jacobian(gpoint)      # J: [ngp, 2], detJ: [ngp]

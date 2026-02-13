@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from dataclasses import dataclass
-from fem_elements import LineElement, QuadElement
+from batch_elements import LineElement, QuadElement
 
 # ----------------------------------------------------------------------
 # Boundary Conditions classes
@@ -203,17 +203,6 @@ class NodalLoads(dict):
         super().__setitem__(key, value)
 
 # ----------------------------------------------------------------------
-# Thickness classes
-# ----------------------------------------------------------------------
-
-class Thickness(dict):
-    """For defining thickness per element group."""
-    def __setitem__(self, key: str, value: float) -> None:
-        if not isinstance(value, (int, float)):
-            raise TypeError("Value must be a number (int or float)")
-        super().__setitem__(key, value)
-
-# ----------------------------------------------------------------------
 # Solver classes
 # ----------------------------------------------------------------------
 
@@ -223,7 +212,7 @@ class BaseSolver:
     def __init__(self,  mesh: object, 
                         bcs: BoundaryConditions, 
                         matfld: dict, 
-                        thickness: Thickness = None,
+                        thickness: float = None,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         line_loads: LineLoads  = None,
@@ -244,9 +233,7 @@ class BaseSolver:
         
         Parameters (if requered)
         ----------
-        thickness: dict
-            {'group_name': thickness_value, ...}
-            Thickness by group of elements.
+        thickness: float
         body_loads: dict
             {'group_name': BodyLoad(), ...}
             Body loads by group of elements.
@@ -263,43 +250,38 @@ class BaseSolver:
         self.mesh = mesh
         self.bcs = bcs                          # Diritchlet Boundary conditions. [node_id, dof (1=u,2=v), value]  
         self.matfld = matfld                    # Where elements material properties are assigned
-        self.thickness = thickness             # Thickness per element group (if any)
+        self.thickness = thickness              # Thickness (if any). Constant in the whole model
         self.body_loads = body_loads            # Body forces (if any)
         self.edge_loads = edge_loads            # Surface tractions (if any)
         self.line_loads = line_loads            # Line loads (if any)
         self.nodal_loads = nodal_loads          # Concentrated forces (if any)
         self.formulation = formulation          # "infinitesimal" / "TLF"
         self.coordinates = mesh.coordinates
-        self.elements = []
+        
+        self.quad_batches = {}
         self.line_elements = []
 
         self.verbose = verbose
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-        # === LOAD FINITE ELEMENTS ===
+        self.coords_tensor = torch.tensor(
+            self.coordinates, dtype=torch.float64, device=self.device)  # (nnod, 2)
+
+        # === LOAD FINITE ELEMENTS BY MATERIAL ===
         if 'quad' in mesh.elements.keys():
-            for element_index, quad_connectivity in enumerate(mesh.elements['quad']):
-                self.elements.append(QuadElement(element_index + 1, quad_connectivity))
-                self.elements[element_index].get_nodal_coordinates(self.coordinates)
+            self._assign_batches_by_matfld(matfld)
+            self.all_dofs_flat = torch.cat([batch.dofs.view(-1) for batch in self.quad_batches.values()])
 
         if 'line' in mesh.elements.keys():
             for element_index, line_connectivity in enumerate(mesh.elements['line']):
-                self.line_elements.append(LineElement(element_index + 1, line_connectivity))
-                self.line_elements[element_index].get_nodal_coordinates(self.coordinates)
-                
+                self.line_elements.append(LineElement([element_index + 1], [line_connectivity]))
+                self.line_elements[element_index]._assign_nodal_coordinates(self.coords_tensor)
 
         # === MESH ATTRIBUTES ===
         self.nnod = mesh.nnod               # Number of nodes
         self.nelem = mesh.nelem             # Number of elements
         self.ndof = self.nnod * 2           # Total number of DOFs  
-
-        # === APPLY MATERIALS ===
-        self._assign_matfld(matfld)
-        self._check_material()              # Checks if all elements have an assigned material
-
-        # === APPLY THICKNESS ===
-        self._assign_thickness()            # For plane stress problems
 
         # === INICIALIZE SOLUTION AND SOLVER DATA ===
         self.udisp = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)  # Displacement vector initialization
@@ -328,23 +310,6 @@ class BaseSolver:
     # ========================================
     # BASE METHODS
     # ========================================
-    
-    def _assign_thickness(self):
-        """Apply thickness to 2D finite elements."""
-        if not self.thickness:
-            return
-
-        for group_name, value in self.thickness.items():
-            if group_name not in self.mesh.element_groups:
-                print(f"[thickness] Warning: group '{group_name}' not in mesh")
-                continue
-
-            for eid in self.mesh.element_groups[group_name]:
-                elem = self.elements[eid - 1]
-                elem.thickness = value               # assign thickness to elements
-
-        if self.verbose:
-            print(f"[thickness] Applied {len(self.thickness)} thickness groups")
 
     def _reinit(self):
         self.udisp.zero_()
@@ -358,32 +323,49 @@ class BaseSolver:
             'iterations': [0]
         }
 
-    def _assign_matfld(self, matfld):
+    def _assign_batches_by_matfld(self, matfld):
         """
-        Assigns material to elements based on element groups.
-        Group 'all' is used as default (fallback).
+        Assigns elements to batches based on their material.
         """
-
+        isMaterial = set()      # For verifying that all elements in mesh have an assigned material
         for group_name, material in matfld.items():
             if group_name not in self.mesh.element_groups:
-                print(f"[matfld] Warning: group '{group_name}' does not exist in mesh")
+                if self.verbose:
+                    print(f"[matfld] Warning: group '{group_name}' does not exist in mesh")
                 continue
-            for elem_id in self.mesh.element_groups[group_name]:
-                self.elements[elem_id - 1].material = material
+
+            elem_ids = list(self.mesh.element_groups[group_name])
+
+            isMaterial.update(elem_ids)
+            nodes_list = [self.mesh.elements['quad'][eid - 1] for eid in elem_ids]
+
+            batch = QuadElement(ids=elem_ids, 
+                                nodes_list=nodes_list, 
+                                material=material, 
+                                thickness = self.thickness, 
+                                device=self.device,
+                                )
+            batch._assign_nodal_coordinates(self.coords_tensor)
+            batch._precompute_constants()
+            batch.material.vectorize(nelem=batch.nelem, ngp2=batch.ngp2)  # Prepare material for vectorized evaluation
+            self.quad_batches[group_name] = batch
 
         if self.verbose:
             print(f"[matfld] Assigned: {list(matfld.keys())}")
         
-    def _check_material(self):
+        self._check_material(isMaterial)
+
+    def _check_material(self, assigned_ids):
         """
         Checks that every element has a material assigned.
-        Raises error if any element has material = None.
+        Raises error if any element is missing.
         """
-        missing = [elem.id for elem in self.elements if elem.material is None]
+        all_quad_ids = set(range(1, len(self.mesh.elements['quad']) + 1)) if 'quad' in self.mesh.elements else set()
+        missing = all_quad_ids - assigned_ids
         if missing:
-            raise ValueError(f"Elements without material: {missing}")
+            raise ValueError(f"Elements without material: {sorted(missing)}")
         if self.verbose:
-            print(f"[matfld] All {self.nelem} elements have assigned material")
+            print(f"[matfld] All {len(all_quad_ids)} quad elements have assigned material")
 
     def _get_dirichlet_bc_data(self) -> list[dict]:
         """
@@ -481,14 +463,23 @@ class BaseSolver:
 
         for group_name, load in self.body_loads.items():
             if group_name not in self.mesh.element_groups:
-                print(f"[body_load] Warning: group '{group_name}' not in mesh")
+                if self.verbose:
+                    print(f"[matfld] Warning: group '{group_name}' does not exist in mesh")
                 continue
 
-            for eid in self.mesh.element_groups[group_name]:
-                elem = self.elements[eid - 1]
-                f_body = elem.compute_body_loads(load.tensor)
-                dofs = elem.dofs
-                self.Fext_total[dofs] += f_body
+            elem_ids = self.mesh.element_groups[group_name]
+            nodes_list = [self.mesh.elements['quad'][eid - 1] for eid in elem_ids]
+
+            batch = QuadElement(ids=elem_ids, 
+                                nodes_list=nodes_list, 
+                                thickness = self.thickness, 
+                                device=self.device,
+                                )
+            batch._assign_nodal_coordinates(self.coords_tensor)
+            batch._precompute_constants()
+            f_body = batch.compute_body_loads(load.tensor)
+            dofs = batch.dofs
+            self.Fext_total[dofs] += f_body
 
         if self.verbose:
             print(f"[body_load] Applied {len(self.body_loads)} body load groups")
@@ -503,13 +494,19 @@ class BaseSolver:
                 print(f"[edge_load] Warning: group '{group_name}' not in mesh")
                 continue
 
-            for eid in self.mesh.element_groups[group_name]:
-                elem = self.elements[eid - 1]
-                f_edge = elem.compute_edge_load(
-                    load.side, load.tensor, load.reference
-                )
-                dofs = elem.dofs
-                self.Fext_total[dofs] += f_edge
+            elem_ids = self.mesh.element_groups[group_name]
+            nodes_list = [self.mesh.elements['quad'][eid - 1] for eid in elem_ids]
+
+            batch = QuadElement(ids=elem_ids, 
+                                nodes_list=nodes_list, 
+                                thickness = self.thickness, 
+                                device=self.device,
+                                )
+            batch._assign_nodal_coordinates(self.coords_tensor)
+            batch._precompute_constants()
+            f_edge = batch.compute_edge_loads(load.side, load.tensor, load.reference)
+            dofs = batch.dofs
+            self.Fext_total[dofs] += f_edge
 
         if self.verbose:
             print(f"[edge_load] Applied {len(self.edge_loads)} edge load groups")
@@ -568,17 +565,17 @@ class BaseSolver:
         Fint = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)
 
         if self.formulation == 'infinitesimal':
-            compute_f = lambda elem: elem.compute_linear_intfor(u)
+            compute_f = lambda batch: batch.compute_linear_intfor(u)
         elif self.formulation == 'TLF':
-            compute_f = lambda elem: elem.compute_nonlinear_intfor(u)
+            compute_f = lambda batch: batch.compute_nonlinear_intfor(u)
         else:
             raise ValueError("Invalid formulation. Must be 'infinitesimal' or 'TLF'.")
-        
-        for elem in self.elements:
-            fint_local = compute_f(elem)           # (ndof_local,)
-            dofs = elem.dofs                          # torch.long tensor, shape (ndof_local,)
-            Fint.scatter_add_(0, dofs, fint_local)
-        
+
+        all_fint = torch.empty(0, dtype=torch.float64, device=self.device)
+        if self.quad_batches:
+            all_fint = torch.cat([compute_f(batch).view(-1) for batch in self.quad_batches.values()])
+        Fint.scatter_add_(0, self.all_dofs_flat, all_fint)
+
         return Fint
 
     def set_load_factor(self, lam: float):
@@ -689,93 +686,95 @@ class BaseSolver:
                             original_alpha: float = 0.3,
                             title: str = None,
                             figsize: tuple = (10, 8)):
-            """
-            Plot deformed mesh (and, optionally, the original one).
+        """
+        Plot deformed mesh (and, optionally, the original one).
 
-            Parameters:
-                scale           displacement scale factor
-                show_original   if True, shows the original mesh
-                original_alpha  transparency of the original mesh
-                title             
-                figsize
-            """
-            import matplotlib.pyplot as plt
-            from matplotlib.lines import Line2D
+        Parameters:
+            scale           displacement scale factor
+            show_original   if True, shows the original mesh
+            original_alpha  transparency of the original mesh
+            title             
+            figsize
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
 
-            fig, ax = plt.subplots(figsize=figsize)
+        fig, ax = plt.subplots(figsize=figsize)
 
-            coords = self.mesh.coordinates.copy()                   # (nnodes, 2)
-            u_nodal = self.udisp.reshape(-1, 2)                     # (nnodes, 2)
-            u_nodal = u_nodal.detach().cpu().numpy()
-            deformed = coords + scale * u_nodal
+        coords = self.mesh.coordinates.copy()                   # (nnodes, 2)
+        u_nodal = self.udisp.reshape(-1, 2)                     # (nnodes, 2)
+        u_nodal = u_nodal.detach().cpu().numpy()
+        deformed = coords + scale * u_nodal
 
-            deformed_color = '#1f77b4'
-            original_color = 'gray'
+        deformed_color = '#1f77b4'
+        original_color = 'gray'
 
-            label_def = "Deformed"
-            label_orig = "Original"
+        label_def = "Deformed"
+        label_orig = "Original"
 
-            if show_nodes:
-                # Plot all nodes
-                ax.scatter(deformed[:, 0], deformed[:, 1], c=deformed_color, s= 10)
+        if show_nodes:
+            # Plot all nodes
+            ax.scatter(deformed[:, 0], deformed[:, 1], c=deformed_color, s= 10)
 
-            for elem in self.elements:
+        first_plot = True
+        for batch in self.quad_batches.values():
 
-                # Determine element nodes (0-based)
-                elem_nodes = elem.nodes - 1
+            # Determine element nodes (0-based)
+            elem_nodes = batch.nodes.cpu().numpy() - 1
+            # Determine the order of nodes
+            edge_order = batch.edge_order
+            
+            for elem in range(batch.nelem):
                 
-                # Determine the order of nodes
-                edge_order = elem.edge_order
-                
+                idx = elem_nodes[elem][edge_order]
                 # Extract original and deformed coordinates
-                Xo = coords[elem_nodes[edge_order], 0]
-                Yo = coords[elem_nodes[edge_order], 1]
-                Xd = deformed[elem_nodes[edge_order], 0]
-                Yd = deformed[elem_nodes[edge_order], 1]
-
+                Xo, Yo = coords[idx, 0], coords[idx, 1]
+                Xd, Yd = deformed[idx, 0], deformed[idx, 1]
+            
                 # Plot deformed mesh
                 ax.plot(Xd, Yd, color=deformed_color, lw=1.6,
-                        label=label_def if elem is self.elements[0] else "")
+                        label=label_def if first_plot else "")
                 ax.fill(Xd, Yd, color=deformed_color, alpha=0.07,
-                        label="" if elem is self.elements[0] else "")
+                        label="" if first_plot else "")
 
                 # Optionally plot original mesh
                 if show_original:
                     ax.plot(Xo, Yo, color=original_color, lw=0.8, ls='--', 
-                            alpha=original_alpha, label=label_orig if elem is self.elements[0] else "")
-            
-            if show_original:
-                if show_nodes:
-                    # Plot all nodes
-                    ax.scatter(coords[:, 0], coords[:, 1], c=original_color, s= 5)
+                            alpha=original_alpha, label=label_orig if first_plot else "")
+                
+                first_plot = False
 
-            # Configuración estética
-            ax.set_aspect('equal')
-            ax.axis('off')
+            if show_nodes:
+                # Plot all nodes
+                ax.scatter(deformed[:, 0], deformed[:, 1], c=deformed_color, s=10, zorder=3)
+                if show_original:
+                    ax.scatter(coords[:, 0], coords[:, 1], c=original_color, s=5, alpha=original_alpha)
 
-            if title is None:
-                title = f"Deformed Mesh - displacement scale x{scale}"
+        # Aesthetic configuration
+        ax.set_aspect('equal')
+        ax.axis('off')
 
-            ax.set_title(title, fontsize=16, pad=20)
+        if title is None:
+            title = f"Deformed Mesh - displacement scale x{scale}"
 
-            # Leyenda limpia
-            handles = [Line2D([0], [0], color=deformed_color, lw=2, label=f'Deformed x{scale}')]
-            if show_original:
-                handles.append(Line2D([0], [0], color=original_color, lw=1, ls='--', alpha=original_alpha, label='Original'))
+        ax.set_title(title, fontsize=16, pad=20)
 
-            ax.legend(handles=handles,
-                        loc='upper left',
-                        bbox_to_anchor=(1.02, 1),
-                        borderaxespad=0,
-                        frameon=True,
-                        fancybox=False,
-                        edgecolor='black',
-                        fontsize=11)
+        # Clean legend
+        handles = [Line2D([0], [0], color=deformed_color, lw=2, label=f'Deformed x{scale}')]
+        if show_original:
+            handles.append(Line2D([0], [0], color=original_color, lw=1, ls='--', alpha=original_alpha, label='Original'))
 
-            plt.subplots_adjust(left=0.01, right=0.80, top=0.94, bottom=0.06)
-            plt.show()
+        ax.legend(handles=handles,
+                    loc='upper left',
+                    bbox_to_anchor=(1.02, 1),
+                    borderaxespad=0,
+                    frameon=True,
+                    fancybox=False,
+                    edgecolor='black',
+                    fontsize=11)
 
-            return
+        plt.subplots_adjust(left=0.01, right=0.80, top=0.94, bottom=0.06)
+        plt.show()
 
 
 class NFEA(BaseSolver):
@@ -785,7 +784,7 @@ class NFEA(BaseSolver):
     def __init__(self,  mesh: object, 
                         bcs: BoundaryConditions, 
                         matfld: dict, 
-                        thickness: Thickness = None,
+                        thickness: float = None,
                         body_loads: BodyLoads = None, 
                         edge_loads: EdgeLoads  = None, 
                         line_loads: LineLoads  = None,
@@ -795,29 +794,30 @@ class NFEA(BaseSolver):
         
         super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, line_loads, nodal_loads, formulation, verbose)
     
+        if 'quad' in mesh.elements.keys():
+            self.all_i_flat = torch.cat([batch.dofs[:, :, None].expand(-1, -1, batch.ndof_local).reshape(-1) for batch in self.quad_batches.values()])
+            self.all_j_flat = torch.cat([batch.dofs[:, None, :].expand(-1, batch.ndof_local, -1).reshape(-1) for batch in self.quad_batches.values()])
+
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
         self.ftol = 1e-6        # Force tolerance
 
         self.maxit = 20         # Maximum number of iterations
 
-    def _assemble_stiffness(self)-> torch.Tensor:
+    def _assemble_stiffness(self) -> torch.Tensor:
         """
         Assemble global stiffness matrix
         """
-        K = torch.zeros(self.ndof, self.ndof, 
-                    dtype=torch.float64, device=self.device)
+        K = torch.zeros(self.ndof, self.ndof, dtype=torch.float64, device=self.device)
 
         compute_Ke = (
-            lambda e: e.compute_linear_stiff()
+            lambda batch: batch.compute_linear_stiff()
             if self.formulation == 'infinitesimal' else
-            e.compute_nonlinear_stiff(self.udisp)
+            batch.compute_nonlinear_stiff(self.udisp)
         )
 
-        for elem in self.elements:
-            Ke = compute_Ke(elem)
-            dofs = elem.dofs
-            K[dofs[:, None], dofs] += Ke
+        all_Ke = torch.cat([compute_Ke(batch).reshape(-1) for batch in self.quad_batches.values()])
+        K.view(-1).scatter_add_(0, self.all_i_flat * self.ndof + self.all_j_flat, all_Ke)
 
         return K
 
@@ -925,7 +925,7 @@ class FEINN(BaseSolver):
                  mesh: object, 
                  bcs: BoundaryConditions, 
                  matfld: dict, 
-                 thickness: Thickness = None,
+                 thickness: float = None,
                  body_loads: BodyLoads = None, 
                  edge_loads: EdgeLoads = None, 
                  line_loads: LineLoads  = None,
@@ -959,8 +959,6 @@ class FEINN(BaseSolver):
             raise ValueError("Invalid initialization method. Choose 'xavier', 'he', or None.")
 
         # Nodal coordinates
-        self.coords_tensor = torch.tensor(
-            self.coordinates, dtype=torch.float64, device=self.device)  # (nnod, 2)
         if normalize_coords:
             self._normalize_coords()
         

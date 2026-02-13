@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
-from fem_elements import QuadElement
+from elements import QuadElement
 
 class Mesh2D:
     """

@@ -1,6 +1,6 @@
 
 import numpy as np
-from fem_utils import QuadShapeFunctions, QuadShapeDerivatives, GaussQuad
+from utils import QuadShapeFunctions, QuadShapeDerivatives, GaussQuad
 
 class MasterElement:
     ' Base class for master finite elements'
