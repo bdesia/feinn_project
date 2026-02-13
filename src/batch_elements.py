@@ -9,7 +9,8 @@ class MasterElement:
 
     def __init__(self, ids: List[int], nodes_list: List[List[int]], material=None, device='cpu'):
             self.ids = torch.tensor(ids, dtype=torch.int, device=device)                # Element IDs    (nelem,)
-            self.nodes = torch.tensor(nodes_list, dtype=torch.int64, device=device)     # List of nodes (nelem, nnode)
+            nodes_array = np.array(nodes_list, dtype=np.int64) 
+            self.nodes = torch.from_numpy(nodes_array).to(device)                       # List of nodes (nelem, nnode)
             self.material = material                                                    # Material object: same material for all elements in batch
             self.device = device
 
