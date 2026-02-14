@@ -16,8 +16,8 @@ class MaterialBase(ABC):
         (multiple elements and Gauss points simultaneously).
     """
 
-    def __init__(self):
-        self.n_state: int = 0  # Default for linear materials; override in nonlinear
+    def __init__(self, n_state: int = 0):
+        self.n_state: int = n_state
         self.is_vectorized: bool = False
         self.nelem: Optional[int] = None
         self.ngp2: Optional[int] = None
@@ -107,6 +107,7 @@ class LinearElastic(MaterialBase):
             Cauchy stress in Voigt notation. Same shape as input.
         """
         C = self.get_constitutive_matrix().to(strain.device)
+        C = C.to(strain.dtype)
         return torch.einsum('...ij,...j->...i', C, strain)
 
     def compute_pk2_stress(self, gl_strain: torch.Tensor) -> torch.Tensor:
@@ -180,6 +181,7 @@ class LinearElasticPlaneStress(MaterialBase):
         """
         
         C = self.get_constitutive_matrix().to(strain.device)
+        C = C.to(strain.dtype)
         return torch.einsum('...ij,...j->...i', C, strain)
     
     def compute_pk2_stress(self, gl_strain: torch.Tensor) -> torch.Tensor:

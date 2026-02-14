@@ -264,9 +264,11 @@ class BaseSolver:
         self.verbose = verbose
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.dtype = None
+        self._set_dtype()
 
         self.coords_tensor = torch.tensor(
-            self.coordinates, dtype=torch.float64, device=self.device)  # (nnod, 2)
+            self.coordinates, dtype=self.dtype, device=self.device)  # (nnod, 2)
 
         # === LOAD FINITE ELEMENTS BY MATERIAL ===
         if 'quad' in mesh.elements.keys():
@@ -275,7 +277,7 @@ class BaseSolver:
 
         if 'line' in mesh.elements.keys():
             for element_index, line_connectivity in enumerate(mesh.elements['line']):
-                self.line_elements.append(LineElement([element_index + 1], [line_connectivity]))
+                self.line_elements.append(LineElement([element_index + 1], [line_connectivity], dtype=self.dtype, device=self.device))
                 self.line_elements[element_index]._assign_nodal_coordinates(self.coords_tensor)
 
         # === MESH ATTRIBUTES ===
@@ -284,7 +286,7 @@ class BaseSolver:
         self.ndof = self.nnod * 2           # Total number of DOFs  
 
         # === INICIALIZE SOLUTION AND SOLVER DATA ===
-        self.udisp = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)  # Displacement vector initialization
+        self.udisp = torch.zeros(self.ndof, dtype=self.dtype, device=self.device)  # Displacement vector initialization
 
         # === ASSEMBLE EXTERNAL FORCE VECTOR ===
         self.Fext_total = torch.zeros_like(self.udisp)
@@ -310,6 +312,9 @@ class BaseSolver:
     # ========================================
     # BASE METHODS
     # ========================================
+
+    def _set_dtype(self):
+        pass
 
     def _reinit(self):
         self.udisp.zero_()
@@ -342,12 +347,15 @@ class BaseSolver:
             batch = QuadElement(ids=elem_ids, 
                                 nodes_list=nodes_list, 
                                 material=material, 
-                                thickness = self.thickness, 
+                                thickness = self.thickness,
+                                dtype=self.dtype, 
                                 device=self.device,
                                 )
+
             batch._assign_nodal_coordinates(self.coords_tensor)
             batch._precompute_constants()
-            batch.material.vectorize(nelem=batch.nelem, ngp2=batch.ngp2)  # Prepare material for vectorized evaluation
+            batch.material.vectorize(nelem=batch.nelem, ngp2=batch.ngp2)    # Prepare material for vectorized evaluation
+            #batch.material.to(dtype=self.dtype, device=self.device)         # Move material to correct dtype/device
             self.quad_batches[group_name] = batch
 
         if self.verbose:
@@ -416,7 +424,7 @@ class BaseSolver:
                 dofs = 2 * nodes_0 + offset  # shape: (n_nodes_in_group,)
 
                 # Constant prescribed value repeated for all nodes in group
-                values = torch.full_like(dofs, fill_value=value, dtype=torch.float64)
+                values = torch.full_like(dofs, fill_value=value, dtype=self.dtype)
 
                 bc_data_list.append({
                     'group_name': group_name,
@@ -477,7 +485,7 @@ class BaseSolver:
                                 )
             batch._assign_nodal_coordinates(self.coords_tensor)
             batch._precompute_constants()
-            f_body = batch.compute_body_loads(load.tensor)
+            f_body = batch.compute_body_loads(load.tensor.to(dtype=self.dtype, device=self.device))
             dofs = batch.dofs
             self.Fext_total[dofs] += f_body
 
@@ -504,7 +512,7 @@ class BaseSolver:
                                 )
             batch._assign_nodal_coordinates(self.coords_tensor)
             batch._precompute_constants()
-            f_edge = batch.compute_edge_loads(load.side, load.tensor, load.reference)
+            f_edge = batch.compute_edge_loads(load.side, load.tensor.to(dtype=self.dtype, device=self.device), load.reference)
             dofs = batch.dofs
             self.Fext_total[dofs] += f_edge
 
@@ -524,7 +532,7 @@ class BaseSolver:
             for eid in self.mesh.element_groups[group_name]:
                 elem = self.line_elements[eid - 1]
                 f_edge = elem.compute_line_load(
-                    load.tensor, load.reference
+                    load.tensor.to(dtype=self.dtype, device=self.device), load.reference
                 )
                 dofs = elem.dofs
                 self.Fext_total[dofs] += f_edge
@@ -550,8 +558,8 @@ class BaseSolver:
             for nid in self.mesh.node_groups[group_name]:
                 ieqn = 2 * (nid-1)	        # Prescribed position
                 fx, fy = load_value.fx, load_value.fy
-                self.Fext_total[ieqn] += fx
-                self.Fext_total[ieqn + 1] += fy
+                self.Fext_total[ieqn] += fx.to(dtype=self.dtype, device=self.device)
+                self.Fext_total[ieqn + 1] += fy.to(dtype=self.dtype, device=self.device)
 
         if self.verbose:
             print(f"[nodal_load] Applied {len(self.nodal_loads)} nodal load groups")      
@@ -562,7 +570,7 @@ class BaseSolver:
         """
 
         u = self.udisp if u is None else u
-        Fint = torch.zeros(self.ndof, dtype=torch.float64, device=self.device)
+        Fint = torch.zeros(self.ndof, dtype=self.dtype, device=self.device)
 
         if self.formulation == 'infinitesimal':
             compute_f = lambda batch: batch.compute_linear_intfor(u)
@@ -571,7 +579,7 @@ class BaseSolver:
         else:
             raise ValueError("Invalid formulation. Must be 'infinitesimal' or 'TLF'.")
 
-        all_fint = torch.empty(0, dtype=torch.float64, device=self.device)
+        all_fint = torch.empty(0, dtype=self.dtype, device=self.device)
         if self.quad_batches:
             all_fint = torch.cat([compute_f(batch).view(-1) for batch in self.quad_batches.values()])
         Fint.scatter_add_(0, self.all_dofs_flat, all_fint)
@@ -804,11 +812,14 @@ class NFEA(BaseSolver):
 
         self.maxit = 20         # Maximum number of iterations
 
+    def _set_dtype(self):
+        self.dtype = torch.float64
+
     def _assemble_stiffness(self) -> torch.Tensor:
         """
         Assemble global stiffness matrix
         """
-        K = torch.zeros(self.ndof, self.ndof, dtype=torch.float64, device=self.device)
+        K = torch.zeros(self.ndof, self.ndof, dtype=self.dtype, device=self.device)
 
         compute_Ke = (
             lambda batch: batch.compute_linear_stiff()
@@ -948,7 +959,8 @@ class FEINN(BaseSolver):
         # Neural network
         self.nnet = nnet if nnet is not None else DEFAULT_NNET
         self.nnet = self.nnet.to(self.device)
-        self.nnet.double()
+        if self.dtype == torch.float64:
+            self.nnet.double()
 
         # Weight initialization
         if nnet_init == 'xavier':
@@ -999,6 +1011,9 @@ class FEINN(BaseSolver):
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
         self.ftol = 1e-6        # Force tolerance
+
+    def _set_dtype(self):
+        self.dtype = torch.float32
 
     def warmup_zero_displacement(self, epochs=500, lr=1e-3):
         """
@@ -1057,7 +1072,7 @@ class FEINN(BaseSolver):
         loss_domain = self.loss_fun(res_pred, res_true) / self.loss_res0
 
         # BC loss   
-        loss_bc = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        loss_bc = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         if self._bc_nodes is not None:
             u_pred_bc_all = u_pred[self._bc_nodes]  # Takes predictions from "u_pred" for the whole domain (n_bc_nodes, 2)
             u_pred_bc = u_pred_bc_all[torch.arange(len(self._bc_nodes)), self._bc_dofs_idx]
@@ -1065,7 +1080,7 @@ class FEINN(BaseSolver):
             loss_bc = self.bc_weight * self.loss_fun(u_pred_bc, self._bc_values)
 
         # Data loss
-        loss_data = torch.tensor(0.0, device=self.device, dtype=torch.float64)
+        loss_data = torch.tensor(0.0, device=self.device, dtype=self.dtype)
         if self.isData:
             pass  #to be implemented
 

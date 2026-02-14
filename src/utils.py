@@ -13,7 +13,6 @@ def LineShapeFunctions(r: torch.tensor, nnode: int) -> torch.tensor:
     Returns:
         H      : torch.Tensor  (..., nnode)  shape functions evaluated at (r)
     """
-    torch.set_default_dtype(torch.float64)
 
     if nnode == 2: # Linear element
 
@@ -64,24 +63,23 @@ def LineShapeDerivatives(r: torch.Tensor, nnode: int) -> torch.Tensor:
                dHr[..., 0, :] = ∂N/∂r
     """
 
-    torch.set_default_dtype(torch.float64)
-
     batch_shape = r.shape
+    dtype = r.dtype
     device = r.device
 
     if nnode == 2:
-        dHr = torch.zeros(*batch_shape, 2, device=device)
+        dHr = torch.zeros(*batch_shape, 2, dtype=dtype, device=device)
         dHr[..., 0] = -0.5 * torch.ones_like(r)
         dHr[..., 1] = 0.5 * torch.ones_like(r)
 
     elif nnode == 3:
-        dHr = torch.zeros(*batch_shape, 3, device=device)
+        dHr = torch.zeros(*batch_shape, 3, dtype=dtype, device=device)
         dHr[..., 0] = r - 0.5
         dHr[..., 1] = r + 0.5
         dHr[..., 2] = -2 * r
 
     elif nnode == 4:
-        dHr = torch.zeros(*batch_shape, 4, device=device)
+        dHr = torch.zeros(*batch_shape, 4, dtype=dtype, device=device)
 
         b = 1.0 / 3
         r2 = r**2
@@ -108,7 +106,8 @@ def QuadShapeFunctions(r: torch.tensor, s: torch.tensor, nnode: int) -> torch.te
     Returns:
         H      : torch.Tensor  (..., nnode)  shape functions evaluated at (r,s)
     """
-    torch.set_default_dtype(torch.float64)
+    dtype = r.dtype
+    device = r.device
 
     if nnode == 4:  # Element Q4
 
@@ -135,7 +134,7 @@ def QuadShapeFunctions(r: torch.tensor, s: torch.tensor, nnode: int) -> torch.te
         #	(-1,-1)	3----7----4 (+1,-1)
         #			   (0,-1)
 
-        H = torch.empty(*r.shape, 8, device=r.device)
+        H = torch.empty(*r.shape, 8, dtype = dtype, device=device)
 
         # Corner nodes
         H[..., 0] = (1 + r) * (1 + s) * (r + s - 1) / 4   # N1 ( 1, 1)
@@ -159,12 +158,12 @@ def QuadShapeFunctions(r: torch.tensor, s: torch.tensor, nnode: int) -> torch.te
         #	(-1,-1)	3----7----4 (+1,-1)
         #			   (0,-1)
 
-        H = torch.empty(*r.shape, 9, device=r.device)
+        H = torch.empty(*r.shape, 9, dtype = dtype, device=device)
 
         # Corner nodes
         H[..., 0] =  r * (1 + r) * s * (1 + s) / 4          # ( 1, 1)
         H[..., 1] =  r * (r - 1) * s * (1 + s) / 4          # (-1, 1)
-        H[..., 2] =  r * (r -  1) * s * (s - 1) / 4       # (-1,-1)
+        H[..., 2] =  r * (r -  1) * s * (s - 1) / 4         # (-1,-1)
         H[..., 3] =  r * (1 + r) * s * (s - 1) / 4          # ( 1,-1)
 
         # Midside nodes (excluded center)
@@ -190,13 +189,12 @@ def QuadShapeDerivatives(r: torch.Tensor, s: torch.Tensor, nnode: int) -> torch.
                dHrs[..., 1, :] = ∂N/∂s
     """
 
-    torch.set_default_dtype(torch.float64)
-
     batch_shape = r.shape
+    dtype = r.dtype
     device = r.device
 
     if nnode == 4:
-        dHrs = torch.zeros(*batch_shape, 2, 4, device=device)
+        dHrs = torch.zeros(*batch_shape, 2, 4, dtype = dtype, device=device)
 
         dHrs[..., 0, 0] = (1 + s) / 4      # dN1/dr
         dHrs[..., 1, 0] = (1 + r) / 4      # dN1/ds
@@ -208,7 +206,7 @@ def QuadShapeDerivatives(r: torch.Tensor, s: torch.Tensor, nnode: int) -> torch.
         dHrs[..., 1, 3] = -(1 + r) / 4
 
     elif nnode == 8:
-        dHrs = torch.zeros(*batch_shape, 2, 8, device=device)
+        dHrs = torch.zeros(*batch_shape, 2, 8, dtype = dtype, device=device)
 
         # Corner node derivatives
         dHrs[..., 0, 0] = (1 + s) * (2*r + s) / 4
@@ -237,7 +235,7 @@ def QuadShapeDerivatives(r: torch.Tensor, s: torch.Tensor, nnode: int) -> torch.
         dHrs[..., 1, 7] = (-1 - r) * s
 
     elif nnode == 9:
-        dHrs = torch.zeros(*batch_shape, 2, 9, device=device)
+        dHrs = torch.zeros(*batch_shape, 2, 9, dtype = dtype, device=device)
 
         # Corner nodes derivatives
         dHrs[..., 0, 0] = (1 + 2*r) * s * (1 + s) / 4
@@ -274,7 +272,7 @@ def QuadShapeDerivatives(r: torch.Tensor, s: torch.Tensor, nnode: int) -> torch.
 
     return dHrs  # (..., 2, nnode)
 
-def GaussQuad(ngp: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def GaussQuad(ngp: int, dtype: torch.dtype = torch.float64) -> Tuple[torch.Tensor, torch.Tensor]:
 
     """
     Gauss Quadrature Data Base (Points and Weigths)
@@ -290,35 +288,33 @@ def GaussQuad(ngp: int) -> Tuple[torch.Tensor, torch.Tensor]:
         Tensor with the Gauss point weigths. Dimension (1 , ngp)
     """
 
-    torch.set_default_dtype(torch.float64)
-
     if ngp == 1:		    # 1 integration point
-        Ri=torch.tensor([0.0000]) # Points
-        Wi=torch.tensor([2.0000]) # Weigths
+        Ri=torch.tensor([0.0000], dtype=dtype) # Points
+        Wi=torch.tensor([2.0000], dtype=dtype) # Weigths
     elif ngp == 2:	        # 2 integration points
-        Ri=torch.tensor([0.577350269189626,-0.577350269189626]) # Points
-        Wi=torch.tensor([1.0000,1.0000]) # Weigths
+        Ri=torch.tensor([0.577350269189626,-0.577350269189626], dtype=dtype) # Points
+        Wi=torch.tensor([1.0000,1.0000], dtype=dtype) # Weigths
     elif ngp == 3:	        # 3 integration points
-        Ri=torch.tensor([0.774596669241483,0.0000,-0.774596669241483]) # Points
-        Wi=torch.tensor([0.555555555555556,0.888888888888889,0.555555555555556]) # Weigths
+        Ri=torch.tensor([0.774596669241483,0.0000,-0.774596669241483], dtype=dtype) # Points
+        Wi=torch.tensor([0.555555555555556,0.888888888888889,0.555555555555556], dtype=dtype    ) # Weigths
     elif ngp == 4:          # 4 integration points
         Ri=torch.tensor([0.861136311594053,0.339981043584856,
-            -0.339981043584856,-0.861136311594053]) # Points
+            -0.339981043584856,-0.861136311594053], dtype=dtype) # Points
         Wi=torch.tensor([0.347854845137454,0.652145154862546,
-            0.652145154862546,0.347854845137454]) # Weigths
+            0.652145154862546,0.347854845137454], dtype=dtype   ) # Weigths
     elif ngp == 5:          # 5 integration points
         Ri=torch.tensor([0.906179845938664,0.538469310105683,0.0000,
-            -0.538469310105683,-0.906179845938664]) # Points
+            -0.538469310105683,-0.906179845938664], dtype=dtype) # Points
         Wi=torch.tensor([0.236926885056189,0.478628670499366,
             0.568888888888889,0.478628670499366,
-                                0.236926885056189]) # Weigths
+                                0.236926885056189], dtype=dtype) # Weigths
     elif ngp == 6: # 6 integration points
         Ri=torch.tensor([0.932469514203152,0.661209386466265,
             0.238619186083197,-0.238619186083197,
-            -0.661209386466265,-0.932469514203152]) # Points
+            -0.661209386466265,-0.932469514203152], dtype=dtype) # Points
         Wi=torch.tensor([0.171324492379170,0.360761573048139,
             0.467913934572691,0.467913934572691,
-            0.360761573048139,0.171324492379170]) # Weigths
+            0.360761573048139,0.171324492379170], dtype=dtype   ) # Weigths
     else:
         raise ValueError("Unsupported number of Gauss Points. Supported: 1 up to 6")
     

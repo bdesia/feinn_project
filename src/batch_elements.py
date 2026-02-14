@@ -7,12 +7,13 @@ from typing import List, Tuple
 class MasterElement:
     ' Base class for master finite elements'
 
-    def __init__(self, ids: List[int], nodes_list: List[List[int]], material=None, device='cpu'):
+    def __init__(self, ids: List[int], nodes_list: List[List[int]], material=None, dtype=torch.float64, device='cpu'):
             self.ids = torch.tensor(ids, dtype=torch.int, device=device)                # Element IDs    (nelem,)
             nodes_array = np.array(nodes_list, dtype=np.int64) 
             self.nodes = torch.from_numpy(nodes_array).to(device)                       # List of nodes (nelem, nnode)
             self.material = material                                                    # Material object: same material for all elements in batch
             self.device = device
+            self.dtype = dtype
 
             self.nelem = len(ids)                   # Number of elements in batch
             self.nnode = self.nodes.shape[1]        # Number of nodes per element (assumes all elements have same number of nodes)
@@ -36,7 +37,7 @@ class MasterElement:
 
     def _vectorized_gauss_points(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """ Returns r, s, w for all ngp² points, shape (ngp²,) """
-            gp1d, w1d = GaussQuad(self.ngp)
+            gp1d, w1d = GaussQuad(self.ngp, dtype=self.dtype)
             gp1d = gp1d.to(self.device)
             w1d = w1d.to(self.device)
 
@@ -64,8 +65,8 @@ class LineElement(MasterElement):
     Line element in 2D for load computation (e.g., distributed loads).
     Supports 2, 3, or 4 nodes.
     """
-    def __init__(self, ids: List[int], nodes: List[List[int]], material=None, device='cpu'):
-        super().__init__(ids, nodes, material, device)
+    def __init__(self, ids: List[int], nodes: List[List[int]], material=None, dtype=torch.float64, device='cpu'):
+        super().__init__(ids, nodes, material, dtype, device)
 
         if self.nnode not in [2, 3, 4]:
             raise ValueError("Unsupported number of nodes. Supported: 2, 3, 4")
@@ -116,7 +117,7 @@ class LineElement(MasterElement):
             raise ValueError("reference must be 'local' or 'global'")
 
         # Gauss points on the line
-        gpoint, weight = GaussQuad(self.ngp)
+        gpoint, weight = GaussQuad(self.ngp, dtype = self.dtype)
         gpoint = gpoint.to(self.device)
         weight = weight.to(self.device)
 
@@ -137,7 +138,7 @@ class LineElement(MasterElement):
             traction_gp = flin.unsqueeze(0).repeat(1, self.ngp, 1)  # Constant in global: [nelem, ngp, 2]
 
         # N matrix: (nelem, ngp, 2, ndof_local)
-        N_edge = torch.zeros(self.nelem, self.ngp, 2, self.ndof_local, dtype=torch.float64, device=self.device)
+        N_edge = torch.zeros(self.nelem, self.ngp, 2, self.ndof_local, dtype=self.dtype, device=self.device)
         N_edge[:, :, 0, 0::2] = H.unsqueeze(0)  # ux components
         N_edge[:, :, 1, 1::2] = H.unsqueeze(0)  # uy components
         # Integration: ∫ N^T t ds = sum_gp N^T @ traction_gp * w * detJ
@@ -152,8 +153,8 @@ class QuadElement(MasterElement):
     Supports both Total Lagrangian formulation for geometric nonlinearity
     and geometrically linear analysis.
     """
-    def __init__(self, ids: List[int], nodes_list: List[List[int]], material=None, thickness=1.0, device='cpu'):
-        super().__init__(ids, nodes_list, material, device)
+    def __init__(self, ids: List[int], nodes_list: List[List[int]], material=None, thickness=1.0, dtype=torch.float64, device='cpu'):
+        super().__init__(ids, nodes_list, material, dtype, device)
         self.thickness = thickness              # Assume same thickness for all elements in batch
         self.ngp = 2 if self.nnode == 4 else 3  # Number of Gauss points
 
@@ -194,7 +195,7 @@ class QuadElement(MasterElement):
             raise ValueError(f"Negative Jacobian in elements {bad_elems.tolist()}")
 
         # Inverse Jacobian: (nelem, ngp², 2, 2)
-        invJ = torch.zeros_like(J)
+        invJ = torch.zeros_like(J, dtype=self.dtype, device=self.device)
         invJ[..., 0, 0] =  J[..., 1, 1]
         invJ[..., 0, 1] = -J[..., 0, 1]
         invJ[..., 1, 0] = -J[..., 1, 0]
@@ -218,7 +219,7 @@ class QuadElement(MasterElement):
     # --------------------------------------
 
     def _compute_B_matrix_lin(self, r: torch.Tensor, s: torch.Tensor):
-        Bl0 = torch.zeros(self.nelem, self.ngp2, 3, self.ndof_local, device=self.device)
+        Bl0 = torch.zeros(self.nelem, self.ngp2, 3, self.ndof_local, dtype=self.dtype,device=self.device)
         Bl0[:, :, 0, 0::2] = self.dHdX[:, :, 0, :]  # ∂N/∂x → ux
         Bl0[:, :, 1, 1::2] = self.dHdX[:, :, 1, :]  # ∂N/∂y → uy
         Bl0[:, :, 2, 0::2] = self.dHdX[:, :, 1, :]  # γxy from uy,x
@@ -231,14 +232,14 @@ class QuadElement(MasterElement):
         return epsilon  # [nelem, ngp², 3] Voigt notation [exx, eyy, 2exy]
 
     def compute_linear_stiff(self) -> torch.Tensor:
-        DDSDDE = self.material.get_constitutive_matrix()                    # (nelem, ngp², 3, 3)
+        DDSDDE = self.material.get_constitutive_matrix().to(dtype=self.dtype, device=self.device)     # (nelem, ngp², 3, 3)
         K_local = torch.einsum('egij, egik, egkl, eg -> ejl', self.Bl0, DDSDDE, self.Bl0, self.weighted_dV)
         return K_local  # (nelem, ndof_local, ndof_local)
 
     def compute_linear_intfor(self, global_disp: torch.Tensor) -> torch.Tensor:
-        local_disp = self.get_local_disp(global_disp)                           # (nelem, nnode, 2)
-        epsilon = self.compute_infinitesimal_strain(local_disp)                 # Usa precomputado
-        sigma_vec = self.material.compute_stress(epsilon)                       # (nelem, ngp², 3)
+        local_disp = self.get_local_disp(global_disp)                                                   # (nelem, nnode, 2)
+        epsilon = self.compute_infinitesimal_strain(local_disp)                                         # Usa precomputado
+        sigma_vec = self.material.compute_stress(epsilon).to(dtype=self.dtype, device=self.device)      # (nelem, ngp², 3)
         Fint_local = torch.einsum('egij,egi,eg->ej', self.Bl0, sigma_vec, self.weighted_dV)
         return Fint_local
 
@@ -259,7 +260,7 @@ class QuadElement(MasterElement):
         return torch.stack([E[...,0,0], E[...,1,1], 2*E[...,0,1]], dim=-1)          # (nelem, ngp², 3)
 
     def _compute_B_matrix_nl(self, grad_u: torch.Tensor):
-        Bl1 = torch.zeros(self.nelem, self.ngp2, 3, self.ndof_local, device=self.device)
+        Bl1 = torch.zeros(self.nelem, self.ngp2, 3, self.ndof_local, dtype=self.dtype, device=self.device)
         Bl1[:, :, 0, 0::2] = grad_u[:, :, 0, 0].unsqueeze(-1) * self.dHdX[:, :, 0, :]
         Bl1[:, :, 0, 1::2] = grad_u[:, :, 1, 0].unsqueeze(-1) * self.dHdX[:, :, 0, :]
         Bl1[:, :, 1, 0::2] = grad_u[:, :, 0, 1].unsqueeze(-1) * self.dHdX[:, :, 1, :]
@@ -267,7 +268,7 @@ class QuadElement(MasterElement):
         Bl1[:, :, 2, 0::2] = grad_u[:, :, 0, 0].unsqueeze(-1) * self.dHdX[:, :, 1, :] + grad_u[:, :, 0, 1].unsqueeze(-1) * self.dHdX[:, :, 0, :]
         Bl1[:, :, 2, 1::2] = grad_u[:, :, 1, 0].unsqueeze(-1) * self.dHdX[:, :, 1, :] + grad_u[:, :, 1, 1].unsqueeze(-1) * self.dHdX[:, :, 0, :]
 
-        Bnl = torch.zeros(self.nelem, self.ngp2, 4, self.ndof_local, device=self.device)
+        Bnl = torch.zeros(self.nelem, self.ngp2, 4, self.ndof_local, dtype=self.dtype, device=self.device)
         Bnl[:, :, 0, 0::2] = self.dHdX[:, :, 0, :]
         Bnl[:, :, 1, 0::2] = self.dHdX[:, :, 1, :]
         Bnl[:, :, 2, 1::2] = self.dHdX[:, :, 0, :]
@@ -282,12 +283,12 @@ class QuadElement(MasterElement):
         F = self.compute_deformation_gradient(grad_u)
         # Material stiffness
         Bl = self.Bl0 + Bl1
-        DDSDDE = self.material.get_constitutive_matrix()                # (nelem, ngp², 3,3)
+        DDSDDE = self.material.get_constitutive_matrix().to(dtype=self.dtype, device=self.device)                # (nelem, ngp², 3,3)
         Kmat_local = torch.einsum('egij, egik, egkl, eg -> ejl', Bl, DDSDDE, Bl, self.weighted_dV)
         # Geometric stiffness
         E_vec = self.compute_green_lagrange_strain(F)
-        S_vec = self.material.compute_pk2_stress(E_vec)
-        S_mat = torch.zeros(self.nelem, self.r_gp.shape[0], 4, 4, dtype=torch.float64, device=self.device)
+        S_vec = self.material.compute_pk2_stress(E_vec).to(dtype=self.dtype, device=self.device)
+        S_mat = torch.zeros(self.nelem, self.r_gp.shape[0], 4, 4, dtype=self.dtype, device=self.device)
         S_mat[:, :, 0, 0] = S_vec[:, :, 0]
         S_mat[:, :, 1, 1] = S_vec[:, :, 1]
         S_mat[:, :, 0, 1] = S_mat[:, :, 1, 0] = S_vec[:, :, 2]
@@ -307,7 +308,7 @@ class QuadElement(MasterElement):
         Bl = self.Bl0 + Bl1
         F = self.compute_deformation_gradient(grad_u)
         E_vec = self.compute_green_lagrange_strain(F)
-        pk2_vec = self.material.compute_pk2_stress(E_vec)
+        pk2_vec = self.material.compute_pk2_stress(E_vec).to(dtype=self.dtype, device=self.device)  # (nelem, ngp², 3)
         Fint_local = torch.einsum('egij,egi,eg->ej', Bl, pk2_vec, self.weighted_dV)
         return Fint_local  # (nelem, ndof_local)
 
@@ -318,7 +319,7 @@ class QuadElement(MasterElement):
 
         H = QuadShapeFunctions(self.r_gp, self.s_gp, self.nnode)    # (ngp², nnode)
         
-        Nshape = torch.zeros(self.nelem, self.ngp2, 2, self.ndof_local, dtype=torch.float64, device=self.device)
+        Nshape = torch.zeros(self.nelem, self.ngp2, 2, self.ndof_local, dtype=self.dtype, device=self.device)
         Nshape[:, :, 0, 0::2] = H.unsqueeze(0)
         Nshape[:, :, 1, 1::2] = H.unsqueeze(0)
 
@@ -359,10 +360,10 @@ class QuadElement(MasterElement):
             4: ([3, 0], ('r',  1.0))   # bottom
         }
 
-        Fedge = torch.zeros(self.nelem, self.ndof_local, device=self.device)
+        Fedge = torch.zeros(self.nelem, self.ndof_local, dtype=self.dtype, device=self.device)
 
         # Gauss points on edge
-        gpoint, weight = GaussQuad(self.ngp - 1)
+        gpoint, weight = GaussQuad(self.ngp - 1, dtype=self.dtype)  # Reduced integration for edge
         gpoint = gpoint.to(self.device)
         weight = weight.to(self.device)
         n_gp_edge = gpoint.shape[0]
@@ -407,7 +408,7 @@ class QuadElement(MasterElement):
             if torch.any(detJ_edge < 1e-12):
                 raise ValueError(f"Near-singular edge Jacobian in elem {self.ids[e].item()}, side {side}")
             # N matrix: (n_gp_edge, 2, ndof_local)
-            N_edge = torch.zeros(n_gp_edge, 2, self.ndof_local, dtype=torch.float64, device=self.device)
+            N_edge = torch.zeros(n_gp_edge, 2, self.ndof_local, dtype=self.dtype, device=self.device)
             N_edge[:, 0, 0::2] = H  # ux
             N_edge[:, 1, 1::2] = H  # uy
             # Integration: ∫ N^T t ds = sum_gp N^T @ traction * w * detJ_edge
