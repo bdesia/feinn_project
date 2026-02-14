@@ -973,6 +973,16 @@ class FEINN(BaseSolver):
         if self.loss_res0 < 1e-12:
             self.loss_res0 = 1.0
 
+        # === BC preprocessing ===
+        bc_data = self._get_dirichlet_bc_data()
+        if bc_data:
+            # Pre-calculamos todo lo necesario para no hacer loops luego
+            self._bc_nodes = torch.cat([bc['nodes_0'] for bc in bc_data])
+            self._bc_dofs_idx = torch.cat([bc['dofs'] % 2 for bc in bc_data]) # 0 para ux, 1 para uy
+            self._bc_values = torch.cat([bc['values'] for bc in bc_data])
+        else:
+            self._bc_nodes = None
+
         # === SET L-BFGS OPTIMIZER ===
         self.lbfgs_optimizer = torch.optim.LBFGS(
             self.nnet.parameters(),
@@ -1046,17 +1056,13 @@ class FEINN(BaseSolver):
         res_true = torch.zeros_like(res_pred)
         loss_domain = self.loss_fun(res_pred, res_true) / self.loss_res0
 
-        # BC loss
+        # BC loss   
         loss_bc = torch.tensor(0.0, device=self.device, dtype=torch.float64)
-        bc_data = self._get_dirichlet_bc_data()
-        if bc_data:
-            nodes = torch.cat([bc['nodes_0'] for bc in bc_data])
-            dofs  = torch.cat([bc['dofs']      for bc in bc_data])
-            u_true = torch.cat([bc['values']    for bc in bc_data])
-
-            u_pred_bc = model(self.coords_tensor[nodes])
-            u_pred_bc = u_pred_bc[torch.arange(len(u_true)), dofs % 2]
-            loss_bc = self.bc_weight * self.loss_fun(u_pred_bc, u_true)
+        if self._bc_nodes is not None:
+            u_pred_bc_all = u_pred[self._bc_nodes]  # Takes predictions from "u_pred" for the whole domain (n_bc_nodes, 2)
+            u_pred_bc = u_pred_bc_all[torch.arange(len(self._bc_nodes)), self._bc_dofs_idx]
+            
+            loss_bc = self.bc_weight * self.loss_fun(u_pred_bc, self._bc_values)
 
         # Data loss
         loss_data = torch.tensor(0.0, device=self.device, dtype=torch.float64)
