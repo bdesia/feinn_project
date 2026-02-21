@@ -831,7 +831,8 @@ class NFEA(BaseSolver):
         K.view(-1).scatter_add_(0, self.all_i_flat * self.ndof + self.all_j_flat, all_Ke)
 
         return K
-
+    
+    @torch.no_grad()
     def _incremental_step(self):
         """
         """
@@ -1086,26 +1087,52 @@ class FEINN(BaseSolver):
 
         total_loss = loss_domain + loss_bc + loss_data
         return total_loss, loss_domain, loss_bc, loss_data
-        
-    def train_one_epoch(self, model, optimizer, scheduler=None):
-        
+
+    def train_one_epoch(self, model, optimizer, balancer=None, scheduler=None):
+
         model.train()
         optimizer.zero_grad()
-
-        total_loss, loss_domain, loss_bc, loss_data = self._compute_total_loss(model)
+        
+        # Compute raw, unweighted losses
+        _, loss_domain, loss_bc, loss_data = self._compute_total_loss(model)
+        
+        # Package current losses for the balancer
+        losses_dict = {
+            'Domain': loss_domain,
+            'BoundaryConditions': loss_bc,
+            'Data': loss_data
+        }
+        
+        # Request dynamic weights if a balancer is active
+        if balancer is not None:
+            balance_info = balancer.update(grad_flow={}, losses=losses_dict)
+            weights = balance_info.get('weights', {})
+            
+            w_domain = weights.get('Domain', 1.0)
+            w_bc = weights.get('BoundaryConditions', 1.0)
+            w_data = weights.get('Data', 1.0)
+            
+            # Reassemble total loss using adaptive weights
+            total_loss = (w_domain * loss_domain) + (w_bc * loss_bc) + (w_data * loss_data)
+        else:
+            # Default unweighted sum
+            total_loss = loss_domain + loss_bc + loss_data
+            
+        # Backpropagate and step
         total_loss.backward()
-
         optimizer.step()
+        
         if scheduler is not None:
             scheduler.step()
-
+            
         loss_list = [loss_domain.detach(), loss_bc.detach(), loss_data.detach(), total_loss.detach()]
         tag_keys = ['Domain', 'BoundaryConditions', 'LabelledData', 'Overall']
         
         return dict(zip(tag_keys, loss_list))
 
     def train(self, epochs: int, 
-              optimizer=None, 
+              optimizer=None,
+              balancer=None, 
               scheduler=None, 
               lbfgs_epochs: int = 0,
               warmup=True,
@@ -1140,7 +1167,8 @@ class FEINN(BaseSolver):
 
         for epoch in range(1, epochs + 1):
             train_results = self.train_one_epoch(model = model, 
-                                                            optimizer = optimizer, 
+                                                            optimizer = optimizer,
+                                                            balancer = balancer, 
                                                             scheduler = scheduler)
 
             # Logging

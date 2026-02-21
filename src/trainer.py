@@ -1,290 +1,136 @@
-
-
-from abc import ABC, abstractmethod
-from collections import deque
-import torch
+import abc
 import math
+import random
+import torch
 from typing import Dict, Any
 
-class LossBalancer(ABC):
+
+class LossBalancer(abc.ABC):
     """
-    Clase base abstracta para estrategias de balanceo adaptativo de pérdidas.
-    Define la interfaz común que todas las estrategias deben implementar.
+    Abstract base class for dynamic loss balancing strategies.
+    Defines the standard interface for updating loss weights during training.
     """
-    
-    def __init__(
-        self,
-        initial_bc_weight: float = 1e4,
-        initial_force_scaler: float = 1.0,
-        update_freq: int = 10,
-        min_bc_weight: float = 1e2,
-        max_bc_weight: float = 1e8,
-        min_force_scaler: float = 0.1,
-        max_force_scaler: float = 10.0,
-    ):
-        self.initial_bc_weight = initial_bc_weight
-        self.initial_force_scaler = initial_force_scaler
-        
-        self.current_bc_weight = initial_bc_weight
-        self.current_force_scaler = initial_force_scaler
-        
-        self.update_freq = update_freq
-        self.min_bc_weight = min_bc_weight
-        self.max_bc_weight = max_bc_weight
-        self.min_force_scaler = min_force_scaler
-        self.max_force_scaler = max_force_scaler
-        
+    def __init__(self, **kwargs):
         self.epoch_counter = 0
 
-    @abstractmethod
+    @abc.abstractmethod
     def update(
         self,
         grad_flow: Dict[str, Dict[str, torch.Tensor]],
         losses: Dict[str, torch.Tensor]
     ) -> Dict[str, Any]:
         """
-        Actualiza los pesos de balanceo basándose en gradientes y pérdidas del epoch actual.
-        
+        Calculates and updates the adaptive weights for the loss components.
+
         Args:
-            grad_flow: Diccionario con claves 'Domain', 'BoundaryConditions', etc.
-                       Cada valor es un dict {param_name: gradient_tensor}
-            losses: Diccionario con pérdidas escalares (e.g. {'Domain': loss_domain, 'BoundaryConditions': loss_bc})
-        
+            grad_flow: Dictionary of gradients (can be empty if not required by the strategy).
+            losses: Dictionary containing the current unweighted loss scalars.
+
         Returns:
-            Dict con información del update (pesos nuevos, si se actualizó, métricas, etc.)
+            Dict containing at least:
+                - 'updated' (bool): Whether weights were successfully updated.
+                - 'weights' (Dict[str, float]): The new adaptive weights for each loss term.
         """
         pass
 
-    def get_current_weights(self) -> Dict[str, float]:
-        """Devuelve los pesos actuales para usar en el cálculo de pérdida."""
-        return {
-            'bc_weight': self.current_bc_weight,
-            'force_scaler': self.current_force_scaler
-        }
 
-    def reset(self):
-        """Resetea el estado (útil si reentrenas el modelo)."""
-        self.epoch_counter = 0
-        self.current_bc_weight = self.initial_bc_weight
-        self.current_force_scaler = self.initial_force_scaler
-        
-
-class GradNormBalancer(LossBalancer):
+class ReLoBraLoBalancer(LossBalancer):
     """
-    Implementación de GradNorm para balanceo adaptativo.
-    
-    Basado en:
-    - Chen et al., "GradNorm: Gradient Normalization for Adaptive Loss Balancing..." (2018)
-    - Adaptaciones comunes en PINNs (Bischof & Kraus, 2021; etc.)
-    
-    Idea principal:
-    Ajustar el peso del término BC para que la norma del gradiente proveniente
-    del loss_domain sea similar a la del loss_bc.
+    Relative Loss Balancing with Random Lookback (ReLoBraLo).
+    Adapts loss weights based on the historical evolution of loss components 
+    without requiring additional gradient computations.
     """
-    
     def __init__(
         self,
-        initial_bc_weight: float = 1e4,
-        initial_force_scaler: float = 1.0,
-        update_freq: int = 20,
-        alpha: float = 0.5,              # Exponente de suavizado (típicamente 0.5 o 1.0)
-        patience: int = 50,              # Ventana para promedio móvil de normas
+        alpha: float = 0.5,             # Balances short-term vs long-term history
+        rho: float = 0.99,              # EMA memory factor for weights
+        temperature: float = 0.1,       # Softmax temperature for weight distribution
+        lookback_prob: float = 0.05,    # Probability to update the historical reference (tR)
         **kwargs
     ):
-        super().__init__(
-            initial_bc_weight=initial_bc_weight,
-            initial_force_scaler=initial_force_scaler,
-            update_freq=update_freq,
-            **kwargs
-        )
-        self.alpha = alpha
-        self.patience = patience
+        # Initialize the abstract base class (sets self.epoch_counter = 0)
+        super().__init__(**kwargs) 
         
-        # Buffers para promedio móvil
-        self.domain_grad_norms = deque(maxlen=patience)
-        self.bc_grad_norms = deque(maxlen=patience)
-
-    def _compute_grad_norm(self, grad_dict: Dict[str, torch.Tensor]) -> float:
-        """Calcula la norma L2 promedio de los gradientes (solo pesos)."""
-        if not grad_dict:
-            return 0.0
-        total_norm_sq = 0.0
-        count = 0
-        for name, grad in grad_dict.items():
-            if grad is not None and 'weight' in name:  # Solo pesos, ignorar biases
-                total_norm_sq += (grad.norm(p=2) ** 2).item()
-                count += 1
-        return math.sqrt(total_norm_sq / (count + 1e-12)) if count > 0 else 0.0
-
+        self.alpha = alpha
+        self.rho = rho
+        self.temperature = temperature
+        self.lookback_prob = lookback_prob
+        
+        # Historical loss records
+        self.loss_0: Dict[str, float] = {}   # Losses at initial step L(0)
+        self.loss_tR: Dict[str, float] = {}  # Losses at last lookback step L(tR)
+        
+        # Current adaptive weights (λ_i)
+        self.lambdas: Dict[str, float] = {}
+        
     def update(
         self,
-        grad_flow: Dict[str, Dict[str, torch.Tensor]],
+        grad_flow: Dict[str, Dict[str, torch.Tensor]], # Unused in ReLoBraLo, required by interface
         losses: Dict[str, torch.Tensor]
     ) -> Dict[str, Any]:
+        """
+        Calculates and updates adaptive weights based on current loss magnitudes.
+        """
         self.epoch_counter += 1
         
-        # Solo actualizar cada update_freq épocas
-        if self.epoch_counter % self.update_freq != 0:
-            return {
-                'updated': False,
-                'bc_weight': self.current_bc_weight,
-                'force_scaler': self.current_force_scaler
-            }
-
-        domain_grad = self._compute_grad_norm(grad_flow.get('Domain', {}))
-        bc_grad = self._compute_grad_norm(grad_flow.get('BoundaryConditions', {}))
-
-        # Evitar división por cero
-        domain_grad = max(domain_grad, 1e-8)
-        bc_grad = max(bc_grad, 1e-8)
-
-        self.domain_grad_norms.append(domain_grad)
-        self.bc_grad_norms.append(bc_grad)
-
-        updated = False
-        info = {
-            'grad_norm_domain': domain_grad,
-            'grad_norm_bc': bc_grad,
-            'updated': False,
-            'bc_weight': self.current_bc_weight,
-            'force_scaler': self.current_force_scaler
-        }
-
-        # Necesitamos al menos algunas muestras para promediar
-        if len(self.domain_grad_norms) < 5:
-            return info
-
-        avg_domain_grad = sum(self.domain_grad_norms) / len(self.domain_grad_norms)
-        avg_bc_grad = sum(self.bc_grad_norms) / len(self.bc_grad_norms)
-
-        # Ratio de normas de gradiente
-        ratio = avg_domain_grad / avg_bc_grad
-        factor = ratio ** self.alpha  # Suavizado con alpha
-
-        new_bc_weight = self.current_bc_weight * factor
-        new_bc_weight = torch.clamp(
-            torch.tensor(new_bc_weight),
-            self.min_bc_weight,
-            self.max_bc_weight
-        ).item()
-
-        if abs(new_bc_weight - self.current_bc_weight) > 1e-2 * self.current_bc_weight:
-            self.current_bc_weight = new_bc_weight
-            updated = True
-
-        info.update({
-            'updated': updated,
-            'bc_weight': self.current_bc_weight,
-            'factor': factor,
-            'ratio': ratio,
-            'avg_grad_domain': avg_domain_grad,
-            'avg_grad_bc': avg_bc_grad
-        })
-
-        return info
-
-class ForceScalerGradNormBalancer(LossBalancer):
-    """
-    """
-    
-    def __init__(
-        self,
-        initial_bc_weight: float = 1e4,
-        initial_force_scaler: float = 1.0,
-        update_freq: int = 20,
-        alpha: float = 0.5,
-        patience: int = 50,
-        min_force_scaler: float = 0.1,
-        max_force_scaler: float = 100.0,   # Puedes permitir valores más altos si querés
-        **kwargs
-    ):
-        super().__init__(
-            initial_bc_weight=initial_bc_weight,
-            initial_force_scaler=initial_force_scaler,
-            update_freq=update_freq,
-            min_bc_weight=initial_bc_weight,      # No lo vamos a cambiar
-            max_bc_weight=initial_bc_weight,
-            min_force_scaler=min_force_scaler,
-            max_force_scaler=max_force_scaler,
-            **kwargs
-        )
-        self.alpha = alpha
-        self.patience = patience
+        # Extract scalar values and ignore empty loss components (e.g., values effectively zero)
+        current_losses = {k: v.item() for k, v in losses.items() if v.item() > 1e-12}
         
-        self.domain_grad_norms = deque(maxlen=patience)
-        self.bc_grad_norms = deque(maxlen=patience)
+        if not current_losses:
+            return {'updated': False, 'weights': self.lambdas, 'lookback_triggered': False}
 
-    def _compute_grad_norm(self, grad_dict: Dict[str, torch.Tensor]) -> float:
-        # (mismo método que antes)
-        if not grad_dict:
-            return 0.0
-        total_norm_sq = 0.0
-        count = 0
-        for name, grad in grad_dict.items():
-            if grad is not None and 'weight' in name:
-                total_norm_sq += (grad.norm(p=2) ** 2).item()
-                count += 1
-        return math.sqrt(total_norm_sq / (count + 1e-12)) if count > 0 else 0.0
+        # Initialize historical states on the first iteration
+        if not self.loss_0:
+            self.loss_0 = current_losses.copy()
+            self.loss_tR = current_losses.copy()
+            self.lambdas = {k: 1.0 for k in current_losses.keys()}
+            return {'updated': True, 'weights': self.lambdas.copy(), 'lookback_triggered': False}
 
-    def update(
-        self,
-        grad_flow: Dict[str, Dict[str, torch.Tensor]],
-        losses: Dict[str, torch.Tensor]
-    ) -> Dict[str, Any]:
-        self.epoch_counter += 1
+        # Compute unnormalized suggested weights (lambda_hat)
+        lambda_hat = {}
+        unnormalized_weights = {}
+        total_exp = 0.0
         
-        if self.epoch_counter % self.update_freq != 0:
-            return {
-                'updated': False,
-                'bc_weight': self.current_bc_weight,
-                'force_scaler': self.current_force_scaler
-            }
+        for k, loss_t in current_losses.items():
+            # Handle late-appearing loss terms safely
+            if k not in self.loss_0:
+                self.loss_0[k] = loss_t
+                self.loss_tR[k] = loss_t
+                self.lambdas[k] = 1.0
+                
+            # Compute relative losses (short and long term)
+            ratio_short = loss_t / (self.loss_tR[k] + 1e-8)
+            ratio_long = loss_t / (self.loss_0[k] + 1e-8)
+            
+            # Expected value before softmax
+            val = (self.alpha * ratio_short + (1 - self.alpha) * ratio_long) / self.temperature
+            
+            # Clip to prevent exponent overflow
+            val = min(val, 50.0)
+            exp_val = math.exp(val)
+            
+            unnormalized_weights[k] = exp_val
+            total_exp += exp_val
+            
+        # Apply Softmax scaling and Exponential Moving Average (EMA)
+        num_losses = len(current_losses)
+        for k in current_losses.keys():
+            if total_exp > 0:
+                # Scale by num_losses to keep overall learning rate consistent
+                lambda_hat[k] = (unnormalized_weights[k] / total_exp) * num_losses
+            else:
+                lambda_hat[k] = 1.0
+                
+            # EMA blending
+            self.lambdas[k] = self.rho * self.lambdas.get(k, 1.0) + (1 - self.rho) * lambda_hat[k]
 
-        domain_grad = self._compute_grad_norm(grad_flow.get('Domain', {}))
-        bc_grad = self._compute_grad_norm(grad_flow.get('BoundaryConditions', {}))
-
-        domain_grad = max(domain_grad, 1e-8)
-        bc_grad = max(bc_grad, 1e-8)
-
-        self.domain_grad_norms.append(domain_grad)
-        self.bc_grad_norms.append(bc_grad)
-
-        if len(self.domain_grad_norms) < 5:
-            return {
-                'updated': False,
-                'bc_weight': self.current_bc_weight,
-                'force_scaler': self.current_force_scaler,
-                'grad_norm_domain': domain_grad,
-                'grad_norm_bc': bc_grad
-            }
-
-        avg_domain_grad = sum(self.domain_grad_norms) / len(self.domain_grad_norms)
-        avg_bc_grad = sum(self.bc_grad_norms) / len(self.bc_grad_norms)
-
-        # Queremos que grad_domain ≈ grad_bc
-        # Si grad_domain < grad_bc → el domain está "demasiado fácil" → aumentar force_scaler
-        ratio = avg_domain_grad / avg_bc_grad
-        factor = ratio ** self.alpha
-
-        new_force_scaler = self.current_force_scaler * factor
-        new_force_scaler = torch.clamp(
-            torch.tensor(new_force_scaler),
-            self.min_force_scaler,
-            self.max_force_scaler
-        ).item()
-
-        updated = abs(new_force_scaler - self.current_force_scaler) > 1e-2 * self.current_force_scaler
-        if updated:
-            self.current_force_scaler = new_force_scaler
-
+        # Trigger Random Lookback stochastically
+        lookback_triggered = random.random() < self.lookback_prob
+        if lookback_triggered:
+            self.loss_tR = current_losses.copy()
+            
         return {
-            'updated': updated,
-            'bc_weight': self.current_bc_weight,        # fijo
-            'force_scaler': self.current_force_scaler,  # actualizado
-            'factor': factor,
-            'ratio': ratio,
-            'avg_grad_domain': avg_domain_grad,
-            'avg_grad_bc': avg_bc_grad,
-            'grad_norm_domain': domain_grad,
-            'grad_norm_bc': bc_grad
+            'updated': True, 
+            'weights': self.lambdas.copy(),
+            'lookback_triggered': lookback_triggered
         }

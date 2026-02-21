@@ -49,7 +49,7 @@ class Mesh2D:
                 raise ValueError("Unsupported number of nodes per element for quad.")
 
     def add_node(self, x: float, y: float):
-        self.coordinates.append(np.array[x, y])
+        self.coordinates.append(np.array([x, y]))
 
     def add_element(self, elem_type: str, connectivity: np.ndarray):
         self._check_elem_type(elem_type)
