@@ -228,7 +228,7 @@ class Mesh2D:
         return
 
     @classmethod
-    def from_salome_med(cls, filepath: str):
+    def from_salome_med(cls, filepath: str, verbose: bool = True):
         """
         Load a 2D mesh exported from SALOME-MECA (SMESH module) in .med format.
         
@@ -319,11 +319,12 @@ class Mesh2D:
         instance.element_groups.update(groups)
         
         # Summary print
-        print(f"Loaded SALOME .med mesh: {instance.nnod} nodes, {instance.nelem} elements")
-        if instance.node_groups:
-            print(f"Node groups ({len(instance.node_groups)}): {list(instance.node_groups.keys())}")
-        if instance.element_groups:
-            print(f"Element groups ({len(instance.element_groups)}): {list(instance.element_groups.keys())}")
+        if verbose:
+            print(f"Loaded SALOME .med mesh: {instance.nnod} nodes, {instance.nelem} elements")
+            if instance.node_groups:
+                print(f"Node groups ({len(instance.node_groups)}): {list(instance.node_groups.keys())}")
+            if instance.element_groups:
+                print(f"Element groups ({len(instance.element_groups)}): {list(instance.element_groups.keys())}")
         
         return instance
 
