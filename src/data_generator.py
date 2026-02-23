@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from scipy.spatial.distance import pdist, squareform
 import os
-import pandas as pd
 from typing import List, Tuple
 
 class StrainHistoryGenerator:
@@ -94,27 +93,37 @@ class StrainHistoryGenerator:
         return exx, eyy, gamma_xy
     
     def save_histories(self, 
-                       histories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]], 
-                       prefix: str = "strain_history",
-                       directory: str = "histories",
-                       include_cartesian: bool = True):
+                    histories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]], 
+                    prefix: str = "strain_history",
+                    directory: str = "histories",
+                    include_cartesian: bool = True):
+        
         os.makedirs(directory, exist_ok=True)
         steps = np.arange(self.n_steps)
         
         for i, (e1, e2, theta) in enumerate(histories):
-            data = {'step': steps, 'e1': e1, 'e2': e2, 'theta': theta}
-            
             if include_cartesian:
                 exx, eyy, gamma_xy = self.to_cartesian(e1, e2, theta)
-                data.update({'exx': exx, 'eyy': eyy, 'gxy': gamma_xy})
+                data = np.column_stack((steps, e1, e2, theta, exx, eyy, gamma_xy))
+                header = 'step,e1,e2,theta,exx,eyy,gxy'
+            else:
+                data = np.column_stack((steps, e1, e2, theta))
+                header = 'step,e1,e2,theta'
             
-            df = pd.DataFrame(data)
-            filename = f"{prefix}_{i:06d}.csv"
+            filename = f"{prefix}_{i+1}.csv"
             filepath = os.path.join(directory, filename)
-            df.to_csv(filepath, index=False)
+            
+            np.savetxt(
+                filepath,
+                data,
+                delimiter=',',
+                header=header,
+                comments='',
+                fmt='%.12e'
+            )
         
-        cols = "step,e1,e2,theta" + (",exx,eyy,gxy" if include_cartesian else "")
-        print(f"Saved {len(histories)} histories → columns: {cols}")
+        cols = header
+        print(f"Saved {len(histories)} histories → columns: {cols} ")
 
     def plot_distribution(self, 
                     histories: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None,
