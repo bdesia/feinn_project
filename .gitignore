@@ -1,14 +1,19 @@
-# Variables de entorno
+# Environmental variables
 .env
 
-# Entornos virtuales
+# Virtual environments
 .venv
 /.venv
 
-# Cache y temporales
+# Cache y temps
 src/__pycache__/
 __pycache__/
 *.pyc
 .pytest_cache/
 .coverage
 htmlcov/
+
+# RVE training data
+notebooks/RVE_data_generation/meshes/*
+notebooks/RVE_data_generation/strain_histories/*
+notebooks/RVE_data_generation/data/*
