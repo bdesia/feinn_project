@@ -3,204 +3,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from batch_elements import LineElement, QuadElement
-
-# ----------------------------------------------------------------------
-# Boundary Conditions classes
-# ----------------------------------------------------------------------
-
-@dataclass(slots=True, frozen=True)
-class BoundaryCondition:
-    dof: int
-    value: float
-
-    def __post_init__(self) -> None:
-            """Validate dof after construction."""
-            if self.dof not in (1, 2):
-                raise ValueError(f"Invalid dof {self.dof}. Must be 1 (ux) or 2 (uy).")
-
-class BoundaryConditions(dict):
-    """
-    Dictionary-like container that only accepts BoundaryCondition objects.
-
-    Example
-    -------
-    bcs = BoundaryConditions()
-    bcs["fixed_bottom"] = BoundaryCondition(dof=1, value=0.0)  # ux = 0
-    bcs["fixed_left"]   = BoundaryCondition(dof=2, value=0.0)  # uy = 0
-    """
-    def __setitem__(self, key: str, value: BoundaryCondition) -> None:
-        if not isinstance(value, BoundaryCondition):
-            raise TypeError("Value must be an instance of BoundaryCondition")
-        super().__setitem__(key, value)
-
-# ----------------------------------------------------------------------
-# Body Loads classes
-# ----------------------------------------------------------------------
-
-@dataclass(slots=True, frozen=True)
-class BodyLoad:
-    """
-    Body load (force per unit volume) applied to a group of elements.
-
-    Attributes
-    ----------
-    bx : float
-        Body force in X-direction ([F]/[L³])
-    by : float
-        Body force in Y-direction ([F]/[L³])
-    """
-    bx: float
-    by: float
-
-    @property
-    def vector(self) -> np.ndarray:
-        """Return the load as a NumPy array [bx, by]."""
-        return np.array([self.bx, self.by], dtype=float)
-    
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [bx, by]."""
-        return torch.tensor([self.bx, self.by], dtype=torch.float64)
-    
-class BodyLoads(dict):
-    """Only accepts BodyLoad objects."""
-    def __setitem__(self, key: str, value: BodyLoad) -> None:
-        if not isinstance(value, BodyLoad):
-            raise TypeError("Value must be an instance of BodyLoad")
-        super().__setitem__(key, value)
-
-
-# ----------------------------------------------------------------------
-# Edge Loads classes
-# ----------------------------------------------------------------------
-
-@dataclass(slots=True, frozen=True)
-class EdgeLoad:
-    """
-    Surface traction applied to a specific side of an element.
-
-    Attributes
-    ----------
-    side : int
-        Element side number (1-based, element-dependent)
-    fnormal : float
-        Normal component of the traction
-    ftangential : float
-        Tangential component of the traction
-    reference : str
-        'local'  - components are given in the element local system
-        'global' - components are given in the global X-Y system
-    """
-
-    side: int
-    fnormal: float
-    ftangential: float
-    reference: str = "local"
-
-    def __post_init__(self) -> None:
-        if self.reference not in {"local", "global"}:
-            raise ValueError(
-                f"Invalid reference '{self.reference}'. Must be 'local' or 'global'."
-            )
-
-    @property
-    def vector(self) -> np.ndarray:
-        """Return the load as a NumPy array [ftangential, fnormal]."""
-        return np.array([self.ftangential, self.fnormal], dtype=float)
-    
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [ftangential, fnormal]."""
-        return torch.tensor([self.ftangential, self.fnormal], dtype=torch.float64)
-    
-class EdgeLoads(dict):
-    """Only accepts EdgeLoad objects."""
-    def __setitem__(self, key: str, value: EdgeLoad) -> None:
-        if not isinstance(value, EdgeLoad):
-            raise TypeError("Value must be an instance of EdgeLoad")
-        super().__setitem__(key, value)
-
-# ----------------------------------------------------------------------
-# Line Loads classes
-# ----------------------------------------------------------------------
-
-@dataclass(slots=True, frozen=True)
-class LineLoad:
-    """
-    Line load applied to a specific 1D element.
-
-    Attributes
-    ----------
-    fx : float
-        X-component of the line load (force per unit length)
-    fy : float
-        Y-component of the line load (force per unit length)
-    reference : str
-        'local'  - components are given in the element local system
-        'global' - components are given in the global X-Y system
-    """
-
-    fx: float
-    fy: float
-    reference: str = "local"
-
-    def __post_init__(self) -> None:
-        if self.reference not in {"local", "global"}:
-            raise ValueError(
-                f"Invalid reference '{self.reference}'. Must be 'local' or 'global'."
-            )
-
-    @property
-    def vector(self) -> np.ndarray:
-        """Return the load as a NumPy array [fx, fy]."""
-        return np.array([self.fx, self.fy], dtype=float)
-    
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [fx, fy]."""
-        return torch.tensor([self.fx, self.fy], dtype=torch.float64)
-    
-class LineLoads(dict):
-    """Only accepts LineLoad objects."""
-    def __setitem__(self, key: str, value: LineLoad) -> None:
-        if not isinstance(value, LineLoad):
-            raise TypeError("Value must be an instance of LineLoad")
-        super().__setitem__(key, value)
-
-# ----------------------------------------------------------------------
-# Nodal Loads classes
-# ----------------------------------------------------------------------
-
-@dataclass(slots=True, frozen=True)
-class NodalLoad:
-    """
-    Concentrated force applied to a node.
-
-    Attributes
-    ----------
-    fx : float
-        Force in X-direction
-    fy : float
-        Force in Y-direction
-    """
-    fx: float
-    fy: float
-
-    def vector(self) -> np.ndarray:
-        """Return the load as a NumPy array [fx, fy]."""
-        return np.array([self.fx, self.fy], dtype=float)
-    
-    @property
-    def tensor(self) -> torch.tensor:
-        """Return the load as a Torch tensor [fx, fy]."""
-        return torch.tensor([self.fx, self.fy], dtype=torch.float64)
-    
-class NodalLoads(dict):
-    """Only accepts NodalLoad objects."""
-    def __setitem__(self, key: str, value: NodalLoad) -> None:
-        if not isinstance(value, NodalLoad):
-            raise TypeError("Value must be an instance of NodalLoad")
-        super().__setitem__(key, value)
+from conditions import *
 
 # ----------------------------------------------------------------------
 # Solver classes
@@ -282,7 +85,6 @@ class BaseSolver:
 
         # === MESH ATTRIBUTES ===
         self.nnod = mesh.nnod               # Number of nodes
-        self.nelem = mesh.nelem             # Number of elements
         self.ndof = self.nnod * 2           # Total number of DOFs  
 
         # === INICIALIZE SOLUTION AND SOLVER DATA ===
@@ -333,6 +135,7 @@ class BaseSolver:
         Assigns elements to batches based on their material.
         """
         isMaterial = set()      # For verifying that all elements in mesh have an assigned material
+        self.nelem = 0
         for group_name, material in matfld.items():
             if group_name not in self.mesh.element_groups:
                 if self.verbose:
@@ -354,9 +157,10 @@ class BaseSolver:
 
             batch._assign_nodal_coordinates(self.coords_tensor)
             batch._precompute_constants()
-            batch.material.vectorize(nelem=batch.nelem, ngp2=batch.ngp2)    # Prepare material for vectorized evaluation
-            #batch.material.to(dtype=self.dtype, device=self.device)         # Move material to correct dtype/device
+            batch.material.vectorize(nelem=batch.nelem, ngp2=batch.ngp2)        # Prepare material for vectorized evaluation
+            #batch.material.to(dtype=self.dtype, device=self.device)            # Move material to correct dtype/device
             self.quad_batches[group_name] = batch
+            self.nelem += batch.nelem                                            # Cumulative number of elements
 
         if self.verbose:
             print(f"[matfld] Assigned: {list(matfld.keys())}")
