@@ -652,6 +652,7 @@ class NFEA(BaseSolver):
         it = 0                  # Iteration counter
         
         du = torch.zeros_like(self.udisp)               # Displacement increment vector initialization
+        Ktan = self._assemble_stiffness()               # Tangent stiffness matrix initialization
         Fint = self._assemble_internal_forces()         # Internal force vector initalization
         residual = self.Fext - Fint
 
@@ -667,9 +668,7 @@ class NFEA(BaseSolver):
         while it < self.maxit:
 
             it += 1											                # Counter iteration update  
-
-            Ktan = self._assemble_stiffness()                               # Tangent stiffness matrix initialization
-            residual = self.Fext - Fint	                                    # Unbalanced forces vector at iteration "it" for the n-step of time    
+  
             res_free = residual[self.free_dofs]                             # Unbalanced forces vector at free dofs only
             # Solve for correction of the displacement increment vector at iteration "it" for the n-step
             du[self.free_dofs] = torch.linalg.solve(
@@ -679,6 +678,7 @@ class NFEA(BaseSolver):
 
             self.udisp[self.free_dofs] += du[self.free_dofs]                # Update displacement vector for the n-step of time  
 
+            Ktan = self._assemble_stiffness()                               # Update tangent stiffness matrix
             Fint = self._assemble_internal_forces()                         # Update internal force vector
             residual = self.Fext - Fint                                     # Update unbalanced forces vector at iteration "it" for the n-step of time                   
 
