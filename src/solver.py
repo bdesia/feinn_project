@@ -20,6 +20,7 @@ class BaseSolver:
                         edge_loads: EdgeLoads  = None, 
                         line_loads: LineLoads  = None,
                         nodal_loads: NodalLoads  = None,
+                        mpcs: MultiPointConstraints = None,
                         formulation: str = 'infinitesimal',
                         verbose: bool = False):
         """
@@ -48,7 +49,8 @@ class BaseSolver:
             Line loads by group of elements.
         nodal_loads: dict
             {'group_name': NodalLoad(), ...}
-            Nodal loads by group of nodes.   
+            Nodal loads by group of nodes.
+        mpcs: MultiPointConstraints  
         """
         self.mesh = mesh
         self.bcs = bcs                          # Diritchlet Boundary conditions. [node_id, dof (1=u,2=v), value]  
@@ -58,6 +60,7 @@ class BaseSolver:
         self.edge_loads = edge_loads            # Surface tractions (if any)
         self.line_loads = line_loads            # Line loads (if any)
         self.nodal_loads = nodal_loads          # Concentrated forces (if any)
+        self.mpcs = mpcs                        # Multi-point constraints (if any)
         self.formulation = formulation          # "infinitesimal" / "TLF"
         self.coordinates = mesh.coordinates
         
@@ -368,13 +371,16 @@ class BaseSolver:
         if self.verbose:
             print(f"[nodal_load] Applied {len(self.nodal_loads)} nodal load groups")      
 
-    def _assemble_internal_forces(self, u: torch.Tensor = None) -> torch.Tensor:
+    def _assemble_internal_forces(self, u: torch.Tensor = None, Fbase: torch.Tensor = None) -> torch.Tensor:
         """
         Assemble global internal force vector
         """
 
         u = self.udisp if u is None else u
-        Fint = torch.zeros(self.ndof, dtype=self.dtype, device=self.device)
+        if Fbase is not None:
+            Fint = Fbase.clone()
+        else:
+            Fint = torch.zeros(self.ndof, dtype=self.dtype, device=self.device)
 
         if self.formulation == 'infinitesimal':
             compute_f = lambda batch: batch.compute_linear_intfor(u)
@@ -601,29 +607,62 @@ class NFEA(BaseSolver):
                         edge_loads: EdgeLoads  = None, 
                         line_loads: LineLoads  = None,
                         nodal_loads: NodalLoads  = None,
+                        mpcs: MultiPointConstraints = None,
                         formulation: str = 'infinitesimal',
                         verbose: bool = False):
         
-        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, line_loads, nodal_loads, formulation, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, 
+                         body_loads, edge_loads, line_loads, nodal_loads, mpcs,
+                         formulation, verbose)
     
         if 'quad' in mesh.elements.keys():
-            self.all_i_flat = torch.cat([batch.dofs[:, :, None].expand(-1, -1, batch.ndof_local).reshape(-1) for batch in self.quad_batches.values()])
-            self.all_j_flat = torch.cat([batch.dofs[:, None, :].expand(-1, batch.ndof_local, -1).reshape(-1) for batch in self.quad_batches.values()])
+            self.all_i_flat = torch.cat([batch.dofs[:, :, None].expand(-1, -1, batch.ndof_local).reshape(-1) 
+                                         for batch in self.quad_batches.values()])
+            self.all_j_flat = torch.cat([batch.dofs[:, None, :].expand(-1, batch.ndof_local, -1).reshape(-1) 
+                                         for batch in self.quad_batches.values()])
 
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
         self.ftol = 1e-6        # Force tolerance
 
         self.maxit = 20         # Maximum number of iterations
+        
+        # Pre-computation of MultiPointConstraints (MPCs) for penalty method
+        self.mpc_C_matrix = None
+        self.mpc_b0s = None
+        
+        if mpcs is not None and mpcs.constraints:
+            num_mpcs = len(mpcs.constraints)
+            
+            self.mpc_b0s = torch.tensor([mpc.b0 for mpc in mpcs.constraints], 
+                                        dtype=self.dtype, device=self.device)
+            
+            C_matrix = torch.zeros((num_mpcs, self.ndof), dtype=self.dtype, device=self.device)
+            row_idx, col_idx, coeffs = [], [], []
+            
+            for i, mpc in enumerate(mpcs.constraints):
+                for node, dof_idx, coeff in mpc.terms:
+                    row_idx.append(i)
+                    col_idx.append(2 * (node - 1) + dof_idx)  # node 1-based
+                    coeffs.append(coeff)
+            
+            C_matrix[row_idx, col_idx] = torch.tensor(coeffs, dtype=self.dtype, device=self.device)
+            self.mpc_C_matrix = C_matrix 
+            
+            if self.verbose:
+                print(f"[NFEA] {num_mpcs} MultiPointConstraints precomputed")
 
     def _set_dtype(self):
         self.dtype = torch.float64
 
-    def _assemble_stiffness(self) -> torch.Tensor:
+    def _assemble_stiffness(self, Kbase: torch.Tensor = None) -> torch.Tensor:
         """
         Assemble global stiffness matrix
         """
-        K = torch.zeros(self.ndof, self.ndof, dtype=self.dtype, device=self.device)
+        if Kbase is not None:
+            K = Kbase.clone()
+        else:
+            K = torch.zeros(self.ndof, self.ndof, dtype=self.dtype, device=self.device)
 
         compute_Ke = (
             lambda batch: batch.compute_linear_stiff()
@@ -636,6 +675,13 @@ class NFEA(BaseSolver):
 
         return K
     
+    def update_mpc_b0s(self):
+        if self.mpc_C_matrix is not None and self.mpcs is not None:
+            self.mpc_b0s = torch.tensor(
+                [mpc.b0 for mpc in self.mpcs.constraints],
+                dtype=self.dtype, device=self.device
+            )
+
     @torch.no_grad()
     def _incremental_step(self):
         """
@@ -650,10 +696,24 @@ class NFEA(BaseSolver):
         err_e = [100.0]          # Inicialization of "error" variable. Energetic criterion
 
         it = 0                  # Iteration counter
-        
+
+        Kpenal = None           # Inicialization of penalty stiffness matrix for MPCs (if any)
+        Fpenal = None           # Inicialization of penalty force vector for MPCs (if any)
+
         du = torch.zeros_like(self.udisp)               # Displacement increment vector initialization
         Ktan = self._assemble_stiffness()               # Tangent stiffness matrix initialization
         Fint = self._assemble_internal_forces()         # Internal force vector initalization
+        
+        if self.mpc_C_matrix is not None:
+            maxK0 = torch.max(torch.abs(Ktan)).item()
+            penalty_weight = 1e6 * maxK0
+
+            Kpenal = penalty_weight * self.mpc_C_matrix.T @ self.mpc_C_matrix
+            Fpenal = penalty_weight * self.mpc_C_matrix.T @ self.mpc_b0s
+
+            Ktan += Kpenal
+            Fint += Fpenal + Kpenal @ self.udisp
+        
         residual = self.Fext - Fint
 
         # Norma inicial del residuo (solo dofs libres)
@@ -668,7 +728,7 @@ class NFEA(BaseSolver):
         while it < self.maxit:
 
             it += 1											                # Counter iteration update  
-  
+
             res_free = residual[self.free_dofs]                             # Unbalanced forces vector at free dofs only
             # Solve for correction of the displacement increment vector at iteration "it" for the n-step
             du[self.free_dofs] = torch.linalg.solve(
@@ -678,13 +738,15 @@ class NFEA(BaseSolver):
 
             self.udisp[self.free_dofs] += du[self.free_dofs]                # Update displacement vector for the n-step of time  
 
-            Ktan = self._assemble_stiffness()                               # Update tangent stiffness matrix
-            Fint = self._assemble_internal_forces()                         # Update internal force vector
+            Ktan = self._assemble_stiffness(Kbase=Kpenal)                   # Update tangent stiffness matrix
+            Fint = self._assemble_internal_forces(Fbase=Fpenal)             # Update internal force vector
+            if self.mpc_C_matrix is not None:
+                 Fint += Kpenal @ self.udisp 
             residual = self.Fext - Fint                                     # Update unbalanced forces vector at iteration "it" for the n-step of time                   
 
-            # --- Criterios de convergencia ---
-            du_norm = torch.norm(du[self.free_dofs])                    # Norm-2. Displacement increment vector for the n-step
-            u_norm  = torch.norm(self.udisp[self.free_dofs])            # Norm-2. Displacement vector for the n-step of the time
+            # --- Convergence criterias  ---
+            du_norm = torch.norm(du[self.free_dofs])                        # Norm-2. Displacement increment vector for the n-step
+            u_norm  = torch.norm(self.udisp[self.free_dofs])                # Norm-2. Displacement vector for the n-step of the time
             res_norm = torch.norm(residual[self.free_dofs])
 
             err_d.append(du_norm / (u_norm + 1e-12))
@@ -755,7 +817,9 @@ class FEINN(BaseSolver):
                  normalize_coords = True,
                  ):
 
-        super().__init__(mesh, bcs, matfld, thickness, body_loads, edge_loads, line_loads, nodal_loads, formulation, verbose)
+        super().__init__(mesh, bcs, matfld, thickness, 
+                         body_loads, edge_loads, line_loads, nodal_loads,
+                         formulation, verbose)
 
         self.isData = isData
         
