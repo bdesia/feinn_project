@@ -18,6 +18,7 @@ torchinfo = "^1.8.0"
 opt-einsum = "^3.4.0"
 scipy = "^1.16.3"
 scikit-learn = "^1.8.0"
+neuraloperator = {git = "https://github.com/neuraloperator/neuraloperator.git"}
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.31.0"
