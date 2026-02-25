@@ -139,7 +139,7 @@ class StrainHistoryGenerator:
                 data = np.column_stack((steps, e1, e2, theta))
                 header = 'step,e1,e2,theta'
             
-            filename = f"{prefix}_{i+1}.csv"
+            filename = f"{prefix}_{i+1:04d}.csv"
             filepath = os.path.join(directory, filename)
             
             np.savetxt(
