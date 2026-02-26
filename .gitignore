@@ -17,3 +17,4 @@ htmlcov/
 notebooks/RVE_data_generation/meshes/*
 notebooks/RVE_data_generation/strain_histories/*
 notebooks/RVE_data_generation/data/*
+notebooks/RVE_data_generation/master_data/*
