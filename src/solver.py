@@ -808,6 +808,7 @@ class FEINN(BaseSolver):
                  edge_loads: EdgeLoads = None, 
                  line_loads: LineLoads  = None,
                  nodal_loads: NodalLoads = None,
+                 mpcs: MultiPointConstraints = None,
                  formulation: str = 'infinitesimal',
                  verbose: bool = False,
                  nnet: nn.Module = None,
@@ -818,11 +819,10 @@ class FEINN(BaseSolver):
                  ):
 
         super().__init__(mesh, bcs, matfld, thickness, 
-                         body_loads, edge_loads, line_loads, nodal_loads,
+                         body_loads, edge_loads, line_loads, nodal_loads, mpcs,
                          formulation, verbose)
-
-        self.isData = isData
         
+        self.isData = isData
         self.bc_weight = bc_weight
         
         # Neural network
