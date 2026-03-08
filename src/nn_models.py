@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class FourierFeatureMapping(nn.Module):
-    def __init__(self, input_dim=2, num_frequencies=32, sigma=1.0):
+    def __init__(self, input_dim: int =2, num_frequencies: int = 128, sigma: float = 1.0):
         super().__init__()
         B_tensor = torch.randn(input_dim, num_frequencies) * sigma
         self.register_buffer('B', B_tensor)
@@ -31,7 +31,10 @@ class mFCNet(nn.Module):
                  num_neurons: int = 64, 
                  activation: nn.Module = nn.Tanh,
                  bias: bool = True,
-                 isFourier: bool = False):
+                 isFourier: bool = False,
+                 nfrequencies: int = 128,
+                 sigma: float = 1.0
+                 ):
         
         super(mFCNet, self).__init__()
 
@@ -45,7 +48,7 @@ class mFCNet(nn.Module):
 
         if isFourier: 
             # Fourier Feature Mapping
-            self.fourier = FourierFeatureMapping(input_dim=input_dim, num_frequencies=32, sigma=2.0)
+            self.fourier = FourierFeatureMapping(input_dim=input_dim, num_frequencies=nfrequencies, sigma=sigma)
             input_dim = self.fourier.out_dim
 
         # U and V branches: linear tranformations of the input
