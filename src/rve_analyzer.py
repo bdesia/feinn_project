@@ -94,7 +94,17 @@ class RVEDataset(Dataset):
         """Ensure HDF5 file handles are closed on object destruction"""
         if self.archive is not None:
             self.archive.close()
-    
+            
+    def __getstate__(self):
+        """Avoid pickling HDF5 file (needed for Windows + multiprocessing)"""
+        state = self.__dict__.copy()
+        state['archive'] = None          # nunca se picklea el handle
+        return state
+
+    def __setstate__(self, state):
+        """Restore state and ensure archive is re-opened lazily in worker process"""
+        self.__dict__.update(state)
+        self.archive = None              # se abre lazy en __getitem__
     def _check_split(self):
         """Validate that the specified split exists in the HDF5 file."""
         with h5py.File(self.h5_path, 'r') as f:
@@ -249,10 +259,10 @@ class DualEncoderFNO(nn.Module):
         # Local Branch: positional embedding + initial lifting
         if self.use_positional_grid:
             x_local = self.positional_embedding(x_local)
-        x = self.lifting(x_local)                         # (B, width, H, W)
+        x = self.lifting(x_local)                           # (B, width, H, W)
 
         # Global Branch: Sinusoidal Embedding
-        global_vec = self.global_embed(x_global)                # (B, global_embed_dim)
+        global_vec = self.global_embed(x_global)            # (B, global_embed_dim)
 
         # Mix Local & Global: FiLM Conditioning
         gamma = self.film_gamma(global_vec).unsqueeze(-1).unsqueeze(-1) + 1
@@ -359,7 +369,7 @@ class Trainer:
             loss, batch_size = self._train_one_batch(batch)
             
             # Weight loss by actual batch size
-            epoch_loss += loss.item() * batch_size
+            epoch_loss += loss.item()
             total_samples += batch_size
 
         # Step standard scheduler
@@ -367,20 +377,20 @@ class Trainer:
             self.scheduler.step()
 
         # Mean epoch loss
-        weighted_loss = epoch_loss / total_samples
+        avg_loss = epoch_loss / total_samples
 
-        return weighted_loss
-    
+        return avg_loss
+
+    @torch.no_grad()
     def _validate_one_batch(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
         """Run one batch and return loss and size """
         # Desactive grad
-        with torch.no_grad():
-            x_local, x_global, y = self._process_batch(batch)
-            batch_size = x_local.size(0)
-            pred = self.model(x_local, x_global)                # Forward pass
-            loss = self.loss_fun(pred, y)                       # Compute loss
+        x_local, x_global, y = self._process_batch(batch)
+        batch_size = x_local.size(0)
+        pred = self.model(x_local, x_global)                # Forward pass
+        loss = self.loss_fun(pred, y)                       # Compute loss
 
-            return loss, batch_size
+        return loss, batch_size
     
     def _validate_one_epoch(self, dataloader: DataLoader) -> float:
         """Executes a single validation epoch and returns the average loss."""
@@ -399,17 +409,17 @@ class Trainer:
             loss, batch_size = self._validate_one_batch(batch)
             
             # Weight loss by actual batch size
-            epoch_loss += loss.item() * batch_size
+            epoch_loss += loss.item()
             total_samples += batch_size
         
         # Mean epoch loss
-        weighted_loss = epoch_loss / total_samples
+        avg_loss = epoch_loss / total_samples
 
         # Step plateau scheduler if used
         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-            self.scheduler.step(weighted_loss)
+            self.scheduler.step(avg_loss)
 
-        return weighted_loss
+        return avg_loss
 
     def fit(self, train_loader: DataLoader, 
                 val_loader: DataLoader, 
