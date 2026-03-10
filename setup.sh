@@ -4,6 +4,9 @@ set -e  # Exit si algo falla
 POETRY_PYPROJECT="pyproject.toml"
 PROJECT_NAME=$(grep 'name =' $POETRY_PYPROJECT | awk -F '"' '{print $2}' | head -1)
 
+DEVICE=${DEVICE:-cuda}
+# DEVICE=${DEVICE:-cpu}
+
 # Validar que se haya extraído el nombre del proyecto
 if [ -z "$PROJECT_NAME" ]; then
     echo "Error: No se pudo extraer el nombre del proyecto de $POETRY_PYPROJECT"
@@ -40,7 +43,17 @@ poetry run pip install --quiet ipykernel jupyterlab-widgets==3.0.13 widgetsnbext
 # Registra el kernel en Jupyter
 poetry run python -m ipykernel install --user --name=$PROJECT_NAME --display-name "Python ($PROJECT_NAME)"
 
-poetry add torch==2.6.0+cpu --source pytorch-cpu
+# PyTorch
+echo "Instalando PyTorch ($DEVICE)..."
+poetry remove torch torchvision torchaudio --quiet || true
+
+if [ "$DEVICE" = "cpu" ]; then
+    echo "→ Versión CPU"
+    poetry add torch torchvision torchaudio --source pytorch-cpu
+else
+    echo "→ Versión CUDA 12.4"
+    poetry add torch torchvision torchaudio --source pytorch-cu124
+fi
 
 # Ahora, obtiene la ruta del entorno virtual precisamente donde está en realidad
 VENV_PATH=$(poetry env info --path)
