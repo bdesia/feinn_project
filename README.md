@@ -56,7 +56,7 @@ Follow this steps:
 
 ### 2nd Part: FNO for Multi-scale in Solid Mechanics
 - ✅ Strain history generation using Gaussin Process with RBF kernel.
-- ⬜ Synthethic data generation via FEM.
+- ✅ Synthethic data generation via FEM.
 - ⬜ FNO subrrogate model implementation.
 - ⬜ Integration of FNO subrrogate model into macro solver.
 - ⬜ Benchmark cases
