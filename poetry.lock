@@ -4347,4 +4347,4 @@ doc = ["pytest", "pytest-mock"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "527206d307ffc35e00cc2e803469f4c4a1d7bbd67206259f8051f9258296a06b"
+content-hash = "ccc6786b13202d369bb2bc8cd0efac408e49ffad3d1b71512a0a45fc99b37809"

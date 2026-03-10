@@ -21,6 +21,7 @@ scikit-learn = "^1.8.0"
 neuraloperator = {git = "https://github.com/neuraloperator/neuraloperator.git"}
 tqdm = "^4.67.3"
 optuna = "^4.7.0"
+wandb = "^0.25.0"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.31.0"
