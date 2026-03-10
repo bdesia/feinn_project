@@ -227,10 +227,10 @@ class DualEncoderFNO(nn.Module):
         # W&B initialization
         with torch.no_grad():
             self.film_gamma.weight.zero_()
-            self.film_gamma.bias.fill_(0.0)
+            self.film_gamma.bias.fill_(1.0)
             self.film_beta.weight.zero_()
             self.film_beta.bias.zero_()
-
+    
         # =============== FNO blocks Core ===============
         self.fno_blocks = FNOBlocks(
             in_channels=hidden_channels,
@@ -265,7 +265,7 @@ class DualEncoderFNO(nn.Module):
         global_vec = self.global_embed(x_global)            # (B, global_embed_dim)
 
         # Mix Local & Global: FiLM Conditioning
-        gamma = self.film_gamma(global_vec).unsqueeze(-1).unsqueeze(-1) + 1
+        gamma = self.film_gamma(global_vec).unsqueeze(-1).unsqueeze(-1)
         beta  = self.film_beta(global_vec).unsqueeze(-1).unsqueeze(-1)  
         x = gamma * x + beta                              # (B, width, H, W)
 
