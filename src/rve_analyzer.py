@@ -303,6 +303,18 @@ class DualEncoderFNO(nn.Module):
         x_local:  (B, in_channels, H, W)  → microstructural field
         x_global: (B, nmacro)             → macroscopic loading / parameters
         """
+        
+        # Check that n_modes does not exceed Nyquist frequency for the input resolution
+        _, _, H, W = x_local.shape
+        max_modes = min(H, W) // 2
+        
+        if self.n_modes > max_modes:
+            raise ValueError(
+                f"Number of modes (n_modes={self.n_modes}) exceeds the Nyquist frequency "
+                f"for the input resolution {H}x{W}. "
+                f"n_modes must be <= {max_modes}."
+            )
+        
         # Local Branch: positional embedding + initial lifting
         if self.use_positional_grid:
             x_local = self.positional_embedding(x_local)
