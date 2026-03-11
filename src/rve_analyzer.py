@@ -24,92 +24,130 @@ try:
 except ModuleNotFoundError:
     wandb_available = False
 
+import torch
+from torch.utils.data import Dataset
+from pathlib import Path
+import h5py
+
 class RVEDataset(Dataset):
     """
     Optimized Dataset for Dual-Encoder FNO Training on RVE Data.
-    - Lazy loading HDF5 with swmr=True for multiprocessing safety.
-    - Channel-first (CHW) layout consistent with NeuralOperator library expectations.
-    - Uses UnitGaussianNormalizers with precomputed stats
+    - Added `in_memory` flag to bypass HDF5 disk I/O during training.
+    - Vectorized normalization and permutation in RAM for massive speedups.
+    - Maintains Lazy loading fallback for low-RAM environments.
     """
 
-    def __init__(self, h5_path: str | Path, split: str = 'train', normalize: bool = True):
+    def __init__(self, h5_path: str | Path, 
+                 split: str = 'train',
+                 fraction: float = 1.0,         # for sub-sampling
+                 normalize: bool = True, 
+                 in_memory: bool = False,):
+        
         self.h5_path = Path(h5_path)
         self.split = split
+        self.fraction = fraction
         self.normalize = normalize
+        self.in_memory = in_memory
         self.archive = None  # Initialized in __getitem__ to avoid pickling errors
 
         self._check_split()
 
         # Initial read for metadata and precomputed statistics
         with h5py.File(self.h5_path, 'r') as f:
-            self.N = f[split]['x_local'].shape[0]
+            N_total = f[split]['x_local'].shape[0]
             stats = f['stats']
 
-            # Normalizers - mean/std are per-channel (shape (C,) or broadcastable)
+            if self.fraction < 1.0:
+                self.N = int(N_total * self.fraction)
+                # h5py requires that boolean or list indices be strictly ordered for fast access
+                indexs = np.sort(np.random.choice(N_total, self.N, replace=False))
+            else:
+                self.N = N_total
+                indexs = slice(None)
+
+            # Normalizers 
             self.x_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_x_local'][:]).float(),   # shape (phase + nstatev,)
+                mean=torch.from_numpy(stats['mean_x_local'][:]).float(),
                 std=torch.from_numpy(stats['std_x_local'][:]).float()
             )
             self.y_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_y_local'][:]).float(),   # shape (3 stresses + nstatev,)
+                mean=torch.from_numpy(stats['mean_y_local'][:]).float(),
                 std=torch.from_numpy(stats['std_y_local'][:]).float()
             )
             self.global_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_x_global'][:]).float(),  # shape (3 strain + nprops,)
+                mean=torch.from_numpy(stats['mean_x_global'][:]).float(),
                 std=torch.from_numpy(stats['std_x_global'][:]).float()
             )
+
+            # --- Load to RAM ---
+            if self.in_memory:
+                print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM. This may take a moment...")
+                # Slicing [:] reads the entire chunk sequentially (extremely fast compared to random access)
+                self.x_local_data = torch.from_numpy(f[split]['x_local'][indexs]).float()
+                self.x_global_data = torch.from_numpy(f[split]['x_global'][indexs]).float()
+                self.y_local_data = torch.from_numpy(f[split]['y_local'][indexs]).float()
+
+                if self.normalize:
+                    # Vectorized operations: Transform the entire dataset at once (C++ backend)
+                    self.x_local_data = self.x_normalizer.transform(self.x_local_data)
+                    self.x_global_data = self.global_normalizer.transform(self.x_global_data)
+                    self.y_local_data = self.y_normalizer.transform(self.y_local_data)
+
+                # Vectorized permutation: (N, H, W, C) -> (N, C, H, W) 
+                # Done once per epoch instead of 60,000 times.
+                self.x_local_data = self.x_local_data.permute(0, 3, 1, 2).contiguous()
+                self.y_local_data = self.y_local_data.permute(0, 3, 1, 2).contiguous()
 
     def __len__(self):
         return self.N
 
     def __getitem__(self, idx):
-        # Open file once per worker process (when DataLoader num_workers > 0)
+        # --- FAST PATH ---
+        if self.in_memory:
+            # Data is already parsed, normalized, permuted, and sitting in CPU RAM.
+            # This takes microseconds.
+            return self.x_local_data[idx], self.x_global_data[idx, :3], self.y_local_data[idx]
+
+        # --- LAZY LOADING FALLBACK ---
         if self.archive is None:
-            self.archive = h5py.File(self.h5_path, 'r', swmr=True)      # swmr: single writer multiple readers
+            self.archive = h5py.File(self.h5_path, 'r', swmr=True)
 
         data = self.archive[self.split]
 
-        # Load from HDF5 (stored as HWC)
-        x_local = torch.from_numpy(data['x_local'][idx]).float()   # (H, W, phase + nstatev + 3 stresses + 3 dstrain)
-        x_global = torch.from_numpy(data['x_global'][idx]).float() # (3 strain + nprops,)
-        y_local  = torch.from_numpy(data['y_local'][idx]).float()  # (H, W, 3 stresses + nstatev)
+        x_local = torch.from_numpy(data['x_local'][idx]).float()
+        x_global = torch.from_numpy(data['x_global'][idx]).float()
+        y_local  = torch.from_numpy(data['y_local'][idx]).float()
 
         if self.normalize:
-            # Apply NeuralOperator normalization (broadcasts across H, W)
             x_local = self.x_normalizer.transform(x_local)
             x_global = self.global_normalizer.transform(x_global)
             y_local = self.y_normalizer.transform(y_local)
 
-        # Permute to Channel-First (CHW) for FNO/Fourier operations
-        x_local = x_local.permute(2, 0, 1).contiguous()   # (channels, H, W)
-        y_local = y_local.permute(2, 0, 1).contiguous()   # (channels, H, W)
+        x_local = x_local.permute(2, 0, 1).contiguous()
+        y_local = y_local.permute(2, 0, 1).contiguous()
 
         return x_local, x_global[:3], y_local
 
     def get_normalizers(self):
-        """Returns all three normalizers for training/inference workflow"""
         return self.x_normalizer, self.global_normalizer, self.y_normalizer
 
     def __del__(self):
-        """Ensure HDF5 file handles are closed on object destruction"""
         if self.archive is not None:
             self.archive.close()
             
     def __getstate__(self):
-        """Avoid pickling HDF5 file (needed for Windows + multiprocessing)"""
         state = self.__dict__.copy()
-        state['archive'] = None          # nunca se picklea el handle
+        state['archive'] = None  
         return state
 
     def __setstate__(self, state):
-        """Restore state and ensure archive is re-opened lazily in worker process"""
         self.__dict__.update(state)
-        self.archive = None              # se abre lazy en __getitem__
+        self.archive = None  
+
     def _check_split(self):
-        """Validate that the specified split exists in the HDF5 file."""
         with h5py.File(self.h5_path, 'r') as f:
             if self.split not in f:
-                raise ValueError(f"Split '{self.split}' not found in {self.h5_path}. Available splits: train, val, test.")
+                raise ValueError(f"Split '{self.split}' not found. Available splits: {list(f.keys())}")
 
 class DualEncoderFNO(nn.Module):
     """
