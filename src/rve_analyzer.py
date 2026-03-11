@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
+from matplotlib import ticker
+from matplotlib.ticker import AutoMinorLocator
 from typing import Optional, Dict, Tuple
 
 import torch
@@ -70,13 +72,13 @@ class RVEDataset(Dataset):
                 mean=torch.from_numpy(stats['mean_x_local'][:]).float(),
                 std=torch.from_numpy(stats['std_x_local'][:]).float()
             )
-            self.y_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_y_local'][:]).float(),
-                std=torch.from_numpy(stats['std_y_local'][:]).float()
-            )
             self.global_normalizer = UnitGaussianNormalizer(
                 mean=torch.from_numpy(stats['mean_x_global'][:]).float(),
                 std=torch.from_numpy(stats['std_x_global'][:]).float()
+            )
+            self.y_normalizer = UnitGaussianNormalizer(
+                mean=torch.from_numpy(stats['mean_y_local'][:]).float(),
+                std=torch.from_numpy(stats['std_y_local'][:]).float()
             )
 
             # --- Load to RAM ---
@@ -97,7 +99,10 @@ class RVEDataset(Dataset):
                 # Done once per epoch instead of 60,000 times.
                 self.x_local_data = self.x_local_data.permute(0, 3, 1, 2).contiguous()
                 self.y_local_data = self.y_local_data.permute(0, 3, 1, 2).contiguous()
-
+                
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
     def __len__(self):
         return self.N
 
@@ -152,7 +157,7 @@ class RVEDataset(Dataset):
 class DualEncoderFNO(nn.Module):
     """
     Dual-Encoder Fourier Neural Operator for RVE Analysis with FiLM Conditioning
-    - Spatial Branch: Lifts local microstructural features (with optional positional grid) to latent space.
+    - Spatial Branch: Lifts local microstructural features (with optional positional grid and sinusoidal embedding) to latent space.
     - Global Branch: Sinusoidal embedding of macroscopic parameters (essential high-frequency encoding).
     - FiLM Conditioning: Feature-wise Linear Modulation using the sinusoidal embedding 
     - FNO Core: Multi-layer Fourier Neural Operator.
@@ -188,25 +193,34 @@ class DualEncoderFNO(nn.Module):
         Ratio of projection channels to hidden_channels.
         The number of projection channels in the projection block of the FNO is
         projection_channel_ratio * hidden_channels (e.g. default 2 * hidden_channels).
+    use_positional_grid : bool, optional
+        If True, add 2D positional grid embeddings to the input of the lifting block. Default: True
     non_linearity : nn.Module, optional
         Non-Linear activation function module to use. Default: nn.GELU()
-
-    TO COMPLETE
-
+    film_per_layer : bool, optional
+        If True, compute separate FiLM parameters for each FNO layer (more expressive, more parameters). 
+        Default: False (one FiLM conditioning previous to the first FNO block).
+    film_mlp_layers : int, optional    
+        Number of layers in the FiLM MLP. Default: 2
+    film_mlp_neurons : int, optional
+        Number of neurons in each hidden layer of the FiLM MLP. Only apply if film_mlp_layers > 1.
+        Default: 128 
     """
 
     def __init__(self,
                  in_channels: int = 1,
                  out_channels: int = 3,
-                 n_macro: int = 7,
+                 n_macro: int = 3,
                  n_modes: int = 16,
                  hidden_channels: int = 64,         # Fourier layer width
                  n_layers: int = 4,
                  lifting_channel_ratio: int = 2,
                  projection_channel_ratio: int = 2,
-                 macro_embed_nfreq: int = 128,
                  use_positional_grid: bool = True,
                  non_linearity: nn.Module = nn.GELU(),
+                 film_per_layer: bool = False,
+                 film_mlp_layers: int = 2,
+                 film_mlp_neurons: int = 128,
                  **fno_blocks_kwargs
                  ):
         super().__init__()
@@ -214,13 +228,15 @@ class DualEncoderFNO(nn.Module):
         self.n_dim = 2      # 2D case
 
         self.n_modes = n_modes
-        self.hidden_channels = hidden_channels          # hidden channels
+        self.hidden_channels = hidden_channels
         self.n_layers = n_layers
 
         self.use_positional_grid = use_positional_grid
         self.n_macro = n_macro
-        self.macro_embed_nfreq = macro_embed_nfreq
 
+        self.film_per_layer = film_per_layer
+        self.film_mlp_layers = film_mlp_layers
+        
         # init lifting and projection channels using ratios w.r.t width
         self.lifting_channel_ratio = lifting_channel_ratio
         self.lifting_channels = int(lifting_channel_ratio * hidden_channels)
@@ -247,28 +263,21 @@ class DualEncoderFNO(nn.Module):
             non_linearity = non_linearity,
             )
 
-        # =============== Global (Macro) Branch ===============
-        # Sinusoidal Embedding 
-        self.global_embed = SinusoidalEmbedding(
-                                in_channels = n_macro,
-                                num_frequencies = macro_embed_nfreq,
-                                embedding_type = 'nerf'
-                            )
-
-        self.global_embed_dim = n_macro * 2 * macro_embed_nfreq
-
-        # =============== Mix Local-Global ===============
-        # FiLM Conditioning (Scale + Shift)
-        self.film_gamma = nn.Linear(self.global_embed_dim, hidden_channels)
-        self.film_beta  = nn.Linear(self.global_embed_dim, hidden_channels)
-
-        # W&B initialization
-        with torch.no_grad():
-            self.film_gamma.weight.zero_()
-            self.film_gamma.bias.fill_(1.0)
-            self.film_beta.weight.zero_()
-            self.film_beta.bias.zero_()
-    
+        # =============== FiLM Conditioning ===============
+        film_out_features = hidden_channels * n_layers if film_per_layer else hidden_channels
+        
+        film_layers = []
+        in_dim = n_macro
+        # Hidden layers if film_mlp_layers > 1
+        for _ in range(max(1, film_mlp_layers) - 1):
+            film_layers.append(nn.Linear(in_dim, film_mlp_neurons))
+            film_layers.append(non_linearity)
+            in_dim = film_mlp_neurons
+        # Output layer
+        film_layers.append(nn.Linear(in_dim, film_out_features * 2))
+        
+        self.film_mlp = nn.Sequential(*film_layers)
+        
         # =============== FNO blocks Core ===============
         self.fno_blocks = FNOBlocks(
             in_channels=hidden_channels,
@@ -299,23 +308,36 @@ class DualEncoderFNO(nn.Module):
             x_local = self.positional_embedding(x_local)
         x = self.lifting(x_local)                           # (B, width, H, W)
 
-        # Global Branch: Sinusoidal Embedding
-        global_vec = self.global_embed(x_global)            # (B, global_embed_dim)
-
-        # Mix Local & Global: FiLM Conditioning
-        gamma = self.film_gamma(global_vec).unsqueeze(-1).unsqueeze(-1)
-        beta  = self.film_beta(global_vec).unsqueeze(-1).unsqueeze(-1)  
-        x = gamma * x + beta                              # (B, width, H, W)
-
-        # FNO Core
+        # Mix Local & Global: Compute FiLM parameters
+        gammas, betas = self._compute_film_params(x_global)
+        
+        # FNO Core w/FiLM conditioning
         output_shape = [None] * self.n_layers
         for layer_idx in range(self.n_layers):
+            if self.film_per_layer:
+                x = gammas[:, layer_idx] * x + betas[:, layer_idx]                          # (B, width, H, W)
+            elif layer_idx == 0:
+                x = gammas * x + betas
             x = self.fno_blocks(x, layer_idx, output_shape=output_shape[layer_idx])
-            
+
         # Output
         x = self.projection(x)
 
         return x    # (B, out_channels, H, W, )
+
+    def _compute_film_params(self, x):
+        film_params = self.film_mlp(x)                  # (B, 2 * film_out_features)
+        gammas, betas = film_params.chunk(2, dim=-1)    # Each one is (B, film_out_features)
+        
+        if self.film_per_layer:
+            # Reshape to (Batch, n_layers, C, 1, 1) 
+            gammas = gammas.view(-1, self.n_layers, self.hidden_channels, 1, 1)
+            betas = betas.view(-1, self.n_layers, self.hidden_channels, 1, 1)
+        else:
+            # Reshape to (Batch, C, 1, 1)
+            gammas = gammas.view(-1, self.hidden_channels, 1, 1)
+            betas = betas.view(-1, self.hidden_channels, 1, 1)
+        return gammas, betas
     
     def count_parameters(self) -> int:
             return sum(p.numel() * 2 if p.is_complex() else p.numel() for p in self.parameters() if p.requires_grad)
@@ -335,10 +357,13 @@ class Trainer:
         max_grad_norm: Optional[float] = 1.0,
         verbose: bool = True,
         ):
-         
+        
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model = model.to(self.device)
-
+        
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+        
         self.verbose = verbose
         # only log to wandb if a run is active
         self.wandb_log = wandb_log and wandb_available and wandb.run is not None
@@ -407,7 +432,7 @@ class Trainer:
             loss, batch_size = self._train_one_batch(batch)
             
             # Weight loss by actual batch size
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() * batch_size
             total_samples += batch_size
 
         # Step standard scheduler
@@ -447,7 +472,7 @@ class Trainer:
             loss, batch_size = self._validate_one_batch(batch)
             
             # Weight loss by actual batch size
-            epoch_loss += loss.item()
+            epoch_loss += loss.item() * batch_size
             total_samples += batch_size
         
         # Mean epoch loss
@@ -525,7 +550,7 @@ class Trainer:
                 print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Best: {self.best_loss:.6f}")
 
             # Early stopping check
-            if self.counter >= patience:
+            if self.counter >= self.patience:
                 print(f"Early stopping triggered at epoch {epoch}")
                 break
 
@@ -555,3 +580,195 @@ class Trainer:
             print(f"Model loaded (Epoch {checkpoint['epoch']}, L2 = {checkpoint['best_loss']:.6f})")
         else:
             print("No saved model found")
+
+class RVEInferencer:
+    """
+    Class to handle FNO model predictions.
+    Takes input tensors, executes the forward pass, and returns
+    denormalized predictions (in real physical scale).
+    """
+    def __init__(self, model, y_normalizer, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        self.model = model
+        self.y_normalizer = y_normalizer
+        self.device = device
+        
+        self.model.to(self.device)
+        self.model.eval()
+
+    @torch.no_grad()
+    def predict(self, x_local, x_global):
+        """
+        Performs inference for a single batch of data.
+        """
+        x_local = x_local.to(self.device)
+        x_global = x_global.to(self.device)
+        
+        # Forward pass
+        pred_norm = self.model(x_local, x_global)
+        
+        # Invert normalization to return to the physical stress scale
+        if self.y_normalizer is not None:
+            pred_physical = self.y_normalizer.inverse_transform(pred_norm)
+        else:
+            pred_physical = pred_norm
+            
+        return pred_physical.cpu().numpy()
+    
+    @torch.no_grad()
+    def predict_dataset(self, dataloader):
+        """
+        Generates predictions for an entire dataloader.
+        Returns numpy arrays of ground-truth and predictions ready for plotting.
+        """
+        all_preds = []
+        all_truths = []
+        
+        for batch in dataloader:
+            x_local, x_global, y_local = batch
+            
+            # Denormalized predictions
+            preds = self.predict(x_local, x_global)
+            
+            # Denormalized ground-truth
+            if self.y_normalizer is not None:
+                truths = self.y_normalizer.inverse_transform(y_local.to(self.device)).cpu().numpy()
+            else:
+                truths = y_local.numpy()
+                
+            all_preds.append(preds)
+            all_truths.append(truths)
+            
+        return np.concatenate(all_truths, axis=0), np.concatenate(all_preds, axis=0)
+
+
+class RVEVisualizer:
+    """
+    Class to visualize and compare Ground-Truth (FEM) results 
+    against model predictions (ML).
+    """
+    
+    @staticmethod
+    def plot_cross_sections(y_true, y_pred, index, hline=None, vline=None, variable='Stress'):
+        """
+        Plots values along horizontal and vertical cross-sectional lines.
+        Adapts dynamically to the RVE grid size.
+        """
+        tt = y_true[index]  # FEM
+        zz = y_pred[index]  # ML
+        
+        # Get grid size dynamically (e.g., 96)
+        L_x, L_y = tt.shape[0], tt.shape[1]
+        
+        # If no cut lines are specified, take the center of the RVE
+        if hline is None: hline = L_y // 2
+        if vline is None: vline = L_x // 2
+
+        # Extract horizontal lines
+        lt11, lz11 = tt[hline, :, 0], zz[hline, :, 0]
+        lt22, lz22 = tt[hline, :, 1], zz[hline, :, 1]
+        lt33, lz33 = tt[hline, :, 2], zz[hline, :, 2]
+        horizontal = np.array([[lt11, lz11], [lt22, lz22], [lt33, lz33]])
+
+        # Extract vertical lines
+        lt11_v, lz11_v = tt[:, vline, 0], zz[:, vline, 0]
+        lt22_v, lz22_v = tt[:, vline, 1], zz[:, vline, 1]
+        lt33_v, lz33_v = tt[:, vline, 2], zz[:, vline, 2]
+        vertical = np.array([[lt11_v, lz11_v], [lt22_v, lz22_v], [lt33_v, lz33_v]])
+
+        fig, ax = plt.subplots(3, 2, figsize=(20, 27))
+        x_axis_hor = np.arange(L_x)
+        x_axis_ver = np.arange(L_y)
+
+        for i in range(ax.shape[0]):
+            # Horizontal Plots
+            ax[i, 0].plot(x_axis_hor, horizontal[i][0], linewidth=6, color='red', label='FEM-Hor')      
+            ax[i, 0].plot(x_axis_hor, horizontal[i][1], linewidth=4, color='black', label='ML-Hor', linestyle='dashed')
+
+            ax[i, 0].xaxis.set_tick_params(which='major', size=10, width=3, direction='in', top=True)
+            ax[i, 0].xaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', top=True)
+            ax[i, 0].yaxis.set_tick_params(which='major', size=10, width=3, direction='in', right=True)
+            ax[i, 0].yaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', right=True)
+            
+            ax[i, 0].yaxis.set_major_locator(ticker.MaxNLocator(6))
+            ax[i, 0].xaxis.set_minor_locator(AutoMinorLocator())
+            ax[i, 0].yaxis.set_minor_locator(AutoMinorLocator())
+            ax[i, 0].yaxis.set_label_coords(-.1, .5)
+            
+            ax[i, 0].set_xlabel('Grid X', labelpad=20) 
+            ax[i, 0].set_ylabel(f'{variable} Component {i+1}', labelpad=20)
+            ax[i, 0].set_xlim(0, L_x - 1)
+            ax[i, 0].legend()
+ 
+            # Vertical Plots
+            ax[i, 1].plot(x_axis_ver, vertical[i][0], linewidth=6, color='red', label='FEM-Vert')  
+            ax[i, 1].plot(x_axis_ver, vertical[i][1], linewidth=4, color='black', label='ML-Vert', linestyle='dashed')
+
+            ax[i, 1].xaxis.set_tick_params(which='major', size=10, width=3, direction='in', top=True)
+            ax[i, 1].xaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', top=True)
+            ax[i, 1].yaxis.set_tick_params(which='major', size=10, width=3, direction='in', right=True)
+            ax[i, 1].yaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', right=True)
+            
+            ax[i, 1].yaxis.set_major_locator(ticker.MaxNLocator(6))
+            ax[i, 1].xaxis.set_minor_locator(AutoMinorLocator())
+            ax[i, 1].yaxis.set_minor_locator(AutoMinorLocator())
+            ax[i, 1].yaxis.set_label_coords(-.12, .5)
+
+            ax[i, 1].set_xlabel('Grid Y', labelpad=15) 
+            ax[i, 1].set_ylabel(f'{variable} Component {i+1}', labelpad=15)
+            ax[i, 1].set_xlim(0, L_y - 1)
+            ax[i, 1].legend()
+
+        plt.tight_layout()
+        plt.show()
+    
+    @staticmethod
+    def plot_contours(y_true, y_pred, index, xcor=None, ycor=None, cmap='Reds'):
+        """
+        Component-wise contour map comparing Ground Truth (Left) vs FNO (Right).
+        """
+        R = y_pred[index].shape[-1]
+        
+        # Generate coordinates if not provided
+        if xcor is None or ycor is None:
+            L_x, L_y = y_true[index].shape[0], y_true[index].shape[1]
+            xcor, ycor = np.meshgrid(np.arange(L_x), np.arange(L_y), indexing='ij')
+
+        fig, ax = plt.subplots(R, 2, figsize=(16, 7 * (R + 0.5)))
+        
+        comb = [y_pred[index], y_true[index]]
+        _min, _max = np.min(comb), np.max(comb)
+        cbarwidth = 0.03
+
+        for j in range(R):
+            # Ground Truth (Left)
+            ax1 = ax[j, 0]
+            pl1 = ax1.pcolormesh(xcor, ycor, y_true[index][:, :, j], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
+            ax1.set_title(f'FEM - Component {j+1}', fontsize=16)
+            ax1.set_yticklabels([])
+            ax1.set_xticklabels([])
+            ax1.xaxis.set_tick_params(width=0)
+            ax1.yaxis.set_tick_params(width=0)
+            ax1.set_aspect('equal')
+            for spine in ax1.spines.values():
+                spine.set_linewidth(3)
+
+            # Prediction (Right)
+            axx2 = ax[j, 1]
+            pcm2 = axx2.pcolormesh(xcor, ycor, y_pred[index][:, :, j], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
+            axx2.set_title(f'FNO ML - Component {j+1}', fontsize=16)
+            axx2.set_yticklabels([])
+            axx2.set_xticklabels([])
+            axx2.xaxis.set_tick_params(width=0)
+            axx2.yaxis.set_tick_params(width=0)
+            axx2.set_aspect('equal')
+            for spine in axx2.spines.values():
+                spine.set_linewidth(3)
+
+        # Global colorbar
+        pos1 = ax[0, 1].get_position()
+        cax = fig.add_axes([0.94, 0.15, cbarwidth, 0.7])
+        colorbar = plt.colorbar(pl1, cax=cax)
+        colorbar.ax.tick_params(labelsize=20) 
+        colorbar.outline.set_linewidth(3)
+        
+        plt.show()
