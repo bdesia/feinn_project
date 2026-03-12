@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 from matplotlib import ticker
 from matplotlib.ticker import AutoMinorLocator
 from typing import Optional, Dict, Tuple
+import json
 
 import torch
 import torch.nn as nn
@@ -353,26 +354,28 @@ class DualEncoderFNO(nn.Module):
             betas = betas.view(-1, self.hidden_channels, 1, 1)
         return gammas, betas
 
-    def save_config(self, path: str | Path = "./checkpoints/DualEncoder_config.pt"):
+    def save_config(self, path: str | Path = "./checkpoints/rve_fno_config.json"):
         """Save model configuration"""
         
         config = {
-        "in_channels": self.in_channels,
-        "out_channels": self.out_channels,
-        "n_macro": self.n_macro,
-        "n_modes": self.n_modes,
-        "hidden_channels": self.hidden_channels,
-        "n_layers": self.n_layers,
-        "lifting_channel_ratio": self.lifting_channel_ratio,
-        "projection_channel_ratio": self.projection_channel_ratio,
-        "use_positional_grid": self.use_positional_grid,
-        "non_linearity": self.non_linearity,
-        "film_per_layer": self.film_per_layer,
-        "film_mlp_layers": self.film_mlp_layers,
-        "film_mlp_neurons": self.film_mlp_neurons,
+            "in_channels": self.in_channels,
+            "out_channels": self.out_channels,
+            "n_macro": self.n_macro,
+            "n_modes": self.n_modes,
+            "hidden_channels": self.hidden_channels,
+            "n_layers": self.n_layers,
+            "lifting_channel_ratio": self.lifting_channel_ratio,
+            "projection_channel_ratio": self.projection_channel_ratio,
+            "use_positional_grid": self.use_positional_grid,
+            "non_linearity": self.non_linearity,
+            "film_per_layer": self.film_per_layer,
+            "film_mlp_layers": self.film_mlp_layers,
+            "film_mlp_neurons": self.film_mlp_neurons,
         }
-                
-        torch.save(config, path)
+        
+        with open(path, 'w') as f:
+                    json.dump(config, f, indent=4)
+
         print(f"Saved configuration at {path}")
         
     def count_parameters(self) -> int:
