@@ -6,7 +6,7 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib import ticker
 from matplotlib.ticker import AutoMinorLocator
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Callable
 
 import torch
 import torch.nn as nn
@@ -386,6 +386,7 @@ class Trainer:
         self,
         model: nn.Module,
         loss_fun: object = None,
+        val_metrics: Dict[str, Callable] = None,
         wandb_log: bool = False,
         device: Optional[torch.device] = None,
         save_dir: str | Path = "checkpoints",
@@ -405,7 +406,8 @@ class Trainer:
         self.wandb_log = wandb_log and wandb_available and wandb.run is not None
 
         self.loss_fun = loss_fun if loss_fun is not None else LpLoss(d=2, p=2)
-
+        self.val_metrics = val_metrics or {}
+        
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
 
@@ -415,7 +417,10 @@ class Trainer:
         self.optimizer = None
         self.scheduler = None
 
-        self.history = {"train_loss": [], "val_loss": []}
+        self.history = {"train_loss": [], "val_loss": [], "lr": []}
+        for metric_name in self.val_metrics.keys():
+                    self.history[f"val_{metric_name}"] = []
+                    
         self.best_loss = float("inf")
         self.best_epoch = 0
         self.counter = 0
@@ -480,45 +485,45 @@ class Trainer:
 
         return avg_loss
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _validate_one_batch(self, batch: Tuple[torch.Tensor, torch.Tensor, torch.Tensor]):
-        """Run one batch and return loss and size """
-        # Desactive grad
         x_local, x_global, y = self._process_batch(batch)
         batch_size = x_local.size(0)
-        pred = self.model(x_local, x_global)                # Forward pass
-        loss = self.loss_fun(pred, y)                       # Compute loss
-
-        return loss, batch_size
-    
-    def _validate_one_epoch(self, dataloader: DataLoader) -> float:
-        """Executes a single validation epoch and returns the average loss."""
         
-        # Set model to evaluation mode
-        self.model.eval()
+        pred = self.model(x_local, x_global)
+        loss = self.loss_fun(pred, y)
 
-        # Initialize loss and number of samples
+        batch_metrics = {name: metric_fn(pred, y).item() for name, metric_fn in self.val_metrics.items()}
+        return loss, batch_size, batch_metrics
+    
+    def _validate_one_epoch(self, dataloader: DataLoader) -> Tuple[float, Dict[str, float]]:
+        """
+        Executes a single validation epoch.
+        Returns:
+            avg_loss: Mean loss for the epoch.
+            avg_metrics: Dictionary of mean values for each extra metric.
+        """
+        self.model.eval()
         epoch_loss = 0.0
         total_samples = 0
+        epoch_metrics_acc = {name: 0.0 for name in self.val_metrics.keys()}
 
-        # Loop over dataloader batches
         for batch in tqdm(dataloader, desc="Valid", leave=False, disable=not self.verbose):
+            loss, batch_size, batch_metrics = self._validate_one_batch(batch)
             
-            # Run batch
-            loss, batch_size = self._validate_one_batch(batch)
-            
-            # Weight loss by actual batch size
             epoch_loss += loss.item() * batch_size
             total_samples += batch_size
+            
+            for name, value in batch_metrics.items():
+                epoch_metrics_acc[name] += value * batch_size
         
-        # Mean epoch loss
         avg_loss = epoch_loss / total_samples
+        avg_metrics = {name: acc / total_samples for name, acc in epoch_metrics_acc.items()}
 
-        # Step plateau scheduler if used
         if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
             self.scheduler.step(avg_loss)
 
-        return avg_loss
+        return avg_loss, avg_metrics
 
     def fit(self, train_loader: DataLoader, 
                 val_loader: DataLoader, 
@@ -545,11 +550,13 @@ class Trainer:
 
         for epoch in range(1, epochs + 1):
             train_loss = self._train_one_epoch(train_loader)
-            val_loss   = self._validate_one_epoch(val_loader)
+            val_loss, val_results = self._validate_one_epoch(val_loader)
 
             self.history["train_loss"].append(train_loss)
             self.history["val_loss"].append(val_loss)
-
+            for name, value in val_results.items():
+                self.history[f"val_{name}"].append(value)
+                
             # Check for best model and save
             is_best = val_loss < (self.best_loss - self.min_delta)
             if is_best:
@@ -577,17 +584,15 @@ class Trainer:
             
             # Logging
             if self.wandb_log:
-                wandb.log({
-                    "train_loss": train_loss,
-                    "val_loss": val_loss,
-                    "lr": current_lr,
-                    "epoch": epoch,
-                    "best_val_loss": self.best_loss,
-                })
+                log_data = {"train_loss": train_loss, "val_loss": val_loss, "lr": current_lr, "epoch": epoch}
+                log_data.update({f"val_{k}": v for k, v in val_results.items()})
+                wandb.log(log_data)
 
-            if verbose or epoch % 10 == 0:
-                print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Best: {self.best_loss:.6f} | LR: {current_lr:.2e}")
-
+            if self.verbose or epoch % 10 == 0:
+                metrics_str = " | ".join([f"{k.upper()}: {v:.6f}" for k, v in val_results.items()])
+                extra = f" | {metrics_str}" if metrics_str else ""
+                print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}{extra} | LR: {current_lr:.2e}")
+            
             # Early stopping check
             if self.counter >= self.patience:
                 print(f"Early stopping triggered at epoch {epoch}")
@@ -617,13 +622,39 @@ class Trainer:
         line3 = ax2.plot(epochs, self.history["lr"], label='Learning Rate', color='tab:red', linewidth=2.2, linestyle='--')
         
         ax2.set_ylabel('Learning Rate', fontsize=12)
-
+        
+        ax2.yaxis.set_major_formatter(ticker.ScalarFormatter(useMathText=True))
+        ax2.ticklabel_format(style='sci', axis='y', scilimits=(0,0))
+        
         # Combine legends from both axes
         lines = line1 + line2 + line3
         labels = [l.get_label() for l in lines]
         ax1.legend(lines, labels, loc='upper right', fontsize=12)
 
         plt.title(title, fontsize=17, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+    def plot_metric(self, metric_name: str, title: str = "DualEncoderFNO Training - Val metrics"):
+        """
+        Plots the evolution of a specific validation metric over epochs.
+        Args:
+            metric_name: Key used in the val_metrics dictionary (e.g., 'mse').
+            title: Custom plot title.
+        """
+        key = f"val_{metric_name}"
+        if key not in self.history:
+            print(f"Metric '{metric_name}' not found in history. Available: {list(self.val_metrics.keys())}")
+            return
+            
+        plt.figure(figsize=(10, 5))
+        plt.plot(range(1, len(self.history[key]) + 1), self.history[key], 
+                 label=f'Validation {metric_name}', color='tab:green', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Value')
+        plt.title(title or f'Validation {metric_name.upper()} over Time')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
         plt.tight_layout()
         plt.show()
 
