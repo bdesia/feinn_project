@@ -226,16 +226,18 @@ class DualEncoderFNO(nn.Module):
         super().__init__()
 
         self.n_dim = 2      # 2D case
-
+        
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.n_macro = n_macro
         self.n_modes = n_modes
         self.hidden_channels = hidden_channels
         self.n_layers = n_layers
-
         self.use_positional_grid = use_positional_grid
-        self.n_macro = n_macro
-
+        self.non_linearity = non_linearity
         self.film_per_layer = film_per_layer
         self.film_mlp_layers = film_mlp_layers
+        self.film_mlp_neurons = film_mlp_neurons
         
         # init lifting and projection channels using ratios w.r.t width
         self.lifting_channel_ratio = lifting_channel_ratio
@@ -350,7 +352,29 @@ class DualEncoderFNO(nn.Module):
             gammas = gammas.view(-1, self.hidden_channels, 1, 1)
             betas = betas.view(-1, self.hidden_channels, 1, 1)
         return gammas, betas
-    
+
+    def save_config(self, path: str | Path = "./checkpoints/DualEncoder_config.pt"):
+        """Save model configuration"""
+        
+        config = {
+        "in_channels": self.in_channels,
+        "out_channels": self.out_channels,
+        "n_macro": self.n_macro,
+        "n_modes": self.n_modes,
+        "hidden_channels": self.hidden_channels,
+        "n_layers": self.n_layers,
+        "lifting_channel_ratio": self.lifting_channel_ratio,
+        "projection_channel_ratio": self.projection_channel_ratio,
+        "use_positional_grid": self.use_positional_grid,
+        "non_linearity": self.non_linearity,
+        "film_per_layer": self.film_per_layer,
+        "film_mlp_layers": self.film_mlp_layers,
+        "film_mlp_neurons": self.film_mlp_neurons,
+        }
+                
+        torch.save(config, path)
+        print(f"Saved configuration at {path}")
+        
     def count_parameters(self) -> int:
             return sum(p.numel() * 2 if p.is_complex() else p.numel() for p in self.parameters() if p.requires_grad)
 
@@ -548,18 +572,21 @@ class Trainer:
             else:
                 self.counter += 1
 
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.history["lr"].append(current_lr)
+            
             # Logging
             if self.wandb_log:
                 wandb.log({
                     "train_loss": train_loss,
                     "val_loss": val_loss,
-                    "lr": self.optimizer.param_groups[0]['lr'],
+                    "lr": current_lr,
                     "epoch": epoch,
                     "best_val_loss": self.best_loss,
                 })
 
             if verbose or epoch % 10 == 0:
-                print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Best: {self.best_loss:.6f}")
+                print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f} | Best: {self.best_loss:.6f} | LR: {current_lr:.2e}")
 
             # Early stopping check
             if self.counter >= self.patience:
@@ -570,17 +597,33 @@ class Trainer:
         return self.history
 
     def plot_history(self, title: str = "DualEncoderFNO Training"):
-        """Plots the training and validation loss curves."""
-
+        """Plots the training and validation loss curves, and the learning rate."""
         epochs = range(1, len(self.history["train_loss"]) + 1)
-        plt.figure(figsize=(11, 6))
-        plt.plot(epochs, self.history["train_loss"], label='Train L2', color='darkgrey', linewidth=2.2)
-        plt.plot(epochs, self.history["val_loss"],   label='Val L2',   color='cornflowerblue', linewidth=2.2)
+        
+        fig, ax1 = plt.subplots(figsize=(11, 6))
+
+        # Loss curves on the primary y-axis (left)
+        line1 = ax1.plot(epochs, self.history["train_loss"], label='Train Loss', color='tab:blue', linewidth=2)
+        line2 = ax1.plot(epochs, self.history["val_loss"], label='Val Loss', color='tab:orange', linewidth=2)
+        
+        ax1.set_xlabel('Epoch', fontsize=12)
+        ax1.set_ylabel('Loss', fontsize=12)
+        ax1.grid(True, alpha=0.35)
+
+        # Create a secondary y-axis for the learning rate
+        ax2 = ax1.twinx()
+        
+        # Plot the learning rate on the secondary y-axis (right)
+        line3 = ax2.plot(epochs, self.history["lr"], label='Learning Rate', color='tab:red', linewidth=2.2, linestyle='--')
+        
+        ax2.set_ylabel('Learning Rate', fontsize=12)
+
+        # Combine legends from both axes
+        lines = line1 + line2 + line3
+        labels = [l.get_label() for l in lines]
+        ax1.legend(lines, labels, loc='upper right', fontsize=12)
+
         plt.title(title, fontsize=17, fontweight='bold')
-        plt.xlabel('Epoch')
-        plt.ylabel('Relative L2 Loss')
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.35)
         plt.tight_layout()
         plt.show()
 
@@ -610,8 +653,14 @@ class RVEInferencer:
     @torch.no_grad()
     def predict(self, x_local, x_global):
         """
-        Performs inference for a single batch of data.
+        Performs inference for a single batch or a single sample of data.
         """
+        # PROTECCIÓN: Si se pasa un tensor sin dimensión de batch (3D), se la agregamos (4D)
+        if x_local.dim() == 3:
+            x_local = x_local.unsqueeze(0)
+        if x_global.dim() == 1:
+            x_global = x_global.unsqueeze(0)
+
         x_local = x_local.to(self.device)
         x_global = x_global.to(self.device)
         
@@ -627,14 +676,21 @@ class RVEInferencer:
         return pred_physical.cpu().numpy()
     
     @torch.no_grad()
-    def predict_dataset(self, dataloader):
+    def predict_dataset(self, data_source, batch_size=16):
         """
-        Generates predictions for an entire dataloader.
+        Generates predictions for an entire dataset or dataloader.
         Returns numpy arrays of ground-truth and predictions ready for plotting.
         """
         all_preds = []
         all_truths = []
         
+        # PROTECCIÓN: Si el usuario pasa un Dataset en lugar de un DataLoader, lo envolvemos.
+        if isinstance(data_source, Dataset):
+            print(f"Dataset detectado. Envolviendo en un DataLoader con batch_size={batch_size}...")
+            dataloader = DataLoader(data_source, batch_size=batch_size, shuffle=False)
+        else:
+            dataloader = data_source
+            
         for batch in dataloader:
             x_local, x_global, y_local = batch
             
@@ -645,13 +701,13 @@ class RVEInferencer:
             if self.y_normalizer is not None:
                 truths = self.y_normalizer.inverse_transform(y_local.to(self.device)).cpu().numpy()
             else:
-                truths = y_local.numpy()
+                # PROTECCIÓN: Aseguramos el .cpu() antes de .numpy() por si y_local estaba en GPU
+                truths = y_local.cpu().numpy() 
                 
             all_preds.append(preds)
             all_truths.append(truths)
             
         return np.concatenate(all_truths, axis=0), np.concatenate(all_preds, axis=0)
-
 
 class RVEVisualizer:
     """
