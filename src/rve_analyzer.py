@@ -567,7 +567,7 @@ class Trainer:
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
-                    'best_loss': self.best_loss,
+                    'val_loss': self.best_loss,
                 }
                 if self.scheduler is not None:
                     checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
@@ -590,7 +590,7 @@ class Trainer:
 
             if self.verbose or epoch % 10 == 0:
                 metrics_str = " | ".join([f"{k.upper()}: {v:.6f}" for k, v in val_results.items()])
-                extra = f" | {metrics_str}" if metrics_str else ""
+                extra = f" | Val {metrics_str}" if metrics_str else ""
                 print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}{extra} | LR: {current_lr:.2e}")
             
             # Early stopping check
@@ -658,12 +658,12 @@ class Trainer:
         plt.tight_layout()
         plt.show()
 
-    def load_best_model(self, model_path):
-        """Loads the weights of the best performing model from disk."""
+    def load_model(self, model_path):
+        """Loads the weights of the model from disk."""
         if model_path.exists():
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=True)
             self.model.load_state_dict(checkpoint['model_state_dict'])
-            print(f"Model loaded (Epoch {checkpoint['epoch']}, L2 = {checkpoint['best_loss']:.6f})")
+            print(f"Model loaded (Epoch {checkpoint['epoch']}, Val loss = {checkpoint['best_loss']:.6f})")
         else:
             print("No saved model found")
 
