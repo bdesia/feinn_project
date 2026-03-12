@@ -7,7 +7,6 @@ import matplotlib.pyplot as plt
 from matplotlib import ticker
 from matplotlib.ticker import AutoMinorLocator
 from typing import Optional, Dict, Tuple
-import json
 
 import torch
 import torch.nn as nn
@@ -354,7 +353,7 @@ class DualEncoderFNO(nn.Module):
             betas = betas.view(-1, self.hidden_channels, 1, 1)
         return gammas, betas
 
-    def save_config(self, path: str | Path = "./checkpoints/rve_fno_config.json"):
+    def save_config(self, path: str | Path = "./checkpoints/rve_fno_config.pth"):
         """Save model configuration"""
         
         config = {
@@ -373,9 +372,7 @@ class DualEncoderFNO(nn.Module):
             "film_mlp_neurons": self.film_mlp_neurons,
         }
         
-        with open(path, 'w') as f:
-                    json.dump(config, f, indent=4)
-
+        torch.save(config, path)
         print(f"Saved configuration at {path}")
         
     def count_parameters(self) -> int:
