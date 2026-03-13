@@ -1845,6 +1845,21 @@ files = [
 ]
 
 [[package]]
+name = "loadenv"
+version = "0.1.1"
+description = "Automatically load environment variables into structured Python data"
+optional = false
+python-versions = ">=3.6"
+groups = ["main"]
+files = [
+    {file = "loadenv-0.1.1-py3-none-any.whl", hash = "sha256:e06a1d86ea1ad89a96aeb470d27de8d569a980ad7c6fd0dd0ee416cc11919853"},
+    {file = "loadenv-0.1.1.tar.gz", hash = "sha256:8dde4a80cf733323880c118659685d822f9d1311fa15b3d7e1e2aa28223aba29"},
+]
+
+[package.extras]
+test = ["tox"]
+
+[[package]]
 name = "mako"
 version = "1.3.10"
 description = "A super-fast templating language that borrows the best ideas from the existing templating languages."
@@ -4733,4 +4748,4 @@ test = ["pytest", "pytest-mock"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "40f476fa737c3ee91f45db5b576d7e8ff692a988f76e6cd396f82434a1d24e3e"
+content-hash = "d2087c35c2fd9dcd6ef1ac34934cb083c18a751de313c0d08427d00a1fcfe830"
