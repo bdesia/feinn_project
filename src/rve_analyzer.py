@@ -591,7 +591,7 @@ class Trainer:
                 log_data.update({f"val_{k}": v for k, v in val_results.items()})
                 wandb.log(log_data)
 
-            if self.verbose or epoch % 10 == 0:
+            if self.verbose and epoch % 10 == 0:
                 metrics_str = " | ".join([f"{k.upper()}: {v:.6f}" for k, v in val_results.items()])
                 extra = f" | Val {metrics_str}" if metrics_str else ""
                 print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}{extra} | LR: {current_lr:.2e}")
