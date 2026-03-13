@@ -24,6 +24,7 @@ wandb = "^0.25.0"
 torchvision = {version = "^0.21.0", source = "pytorch-cu124"}
 torchaudio = {version = "^2.6.0", source = "pytorch-cu124"}
 torch = {version = "^2.6.0", source = "pytorch-cu124"}
+optuna-integration = {extras = ["wandb"], version = "^4.7.0"}
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.31.0"
