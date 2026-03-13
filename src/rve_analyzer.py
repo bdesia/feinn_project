@@ -390,6 +390,7 @@ class Trainer:
         wandb_log: bool = False,
         device: Optional[torch.device] = None,
         save_dir: str | Path = "checkpoints",
+        save: bool = True,
         min_delta: float = 1e-6,        # for saving best model
         max_grad_norm: Optional[float] = 1.0,
         verbose: bool = True,
@@ -408,6 +409,7 @@ class Trainer:
         self.loss_fun = loss_fun if loss_fun is not None else LpLoss(d=2, p=2)
         self.val_metrics = val_metrics or {}
         
+        self.save = save
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(exist_ok=True, parents=True)
 
@@ -571,8 +573,9 @@ class Trainer:
                 }
                 if self.scheduler is not None:
                     checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-                    
-                torch.save(checkpoint, self.save_dir / model_name)
+                
+                if self.save:
+                    torch.save(checkpoint, self.save_dir / model_name)
 
                 if verbose:
                     print(f"   Best model saved (Epoch {epoch})")
