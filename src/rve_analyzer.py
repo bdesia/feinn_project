@@ -591,7 +591,7 @@ class Trainer:
                 log_data.update({f"val_{k}": v for k, v in val_results.items()})
                 wandb.log(log_data)
 
-            if self.verbose and epoch % 10 == 0:
+            if self.verbose:
                 metrics_str = " | ".join([f"{k.upper()}: {v:.6f}" for k, v in val_results.items()])
                 extra = f" | Val {metrics_str}" if metrics_str else ""
                 print(f"Epoch {epoch:3d}/{epochs} | Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}{extra} | LR: {current_lr:.2e}")
@@ -681,15 +681,16 @@ class RVEInferencer:
         self.y_normalizer = y_normalizer
         self.device = device
         
+        self.y_normalizer.to(self.device)
         self.model.to(self.device)
         self.model.eval()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def predict(self, x_local, x_global):
         """
         Performs inference for a single batch or a single sample of data.
         """
-        # PROTECCIÓN: Si se pasa un tensor sin dimensión de batch (3D), se la agregamos (4D)
+        # add batch dimension (just in case)
         if x_local.dim() == 3:
             x_local = x_local.unsqueeze(0)
         if x_global.dim() == 1:
@@ -709,56 +710,49 @@ class RVEInferencer:
             
         return pred_physical.cpu().numpy()
     
-    @torch.no_grad()
-    def predict_dataset(self, data_source, batch_size=16):
-        """
-        Generates predictions for an entire dataset or dataloader.
-        Returns numpy arrays of ground-truth and predictions ready for plotting.
-        """
-        all_preds = []
-        all_truths = []
+    @torch.inference_mode()
+    def predict_dataset(self, dataloader):
+        self.model.eval()
+        y_preds = []
+        y_trues = []
         
-        # PROTECCIÓN: Si el usuario pasa un Dataset en lugar de un DataLoader, lo envolvemos.
-        if isinstance(data_source, Dataset):
-            print(f"Dataset detectado. Envolviendo en un DataLoader con batch_size={batch_size}...")
-            dataloader = DataLoader(data_source, batch_size=batch_size, shuffle=False)
-        else:
-            dataloader = data_source
-            
         for batch in dataloader:
             x_local, x_global, y_local = batch
-            
-            # Denormalized predictions
-            preds = self.predict(x_local, x_global)
-            
-            # Denormalized ground-truth
-            if self.y_normalizer is not None:
-                truths = self.y_normalizer.inverse_transform(y_local.to(self.device)).cpu().numpy()
-            else:
-                # PROTECCIÓN: Aseguramos el .cpu() antes de .numpy() por si y_local estaba en GPU
-                truths = y_local.cpu().numpy() 
-                
-            all_preds.append(preds)
-            all_truths.append(truths)
-            
-        return np.concatenate(all_truths, axis=0), np.concatenate(all_preds, axis=0)
+            x_local = x_local.to(self.device)
+            x_global = x_global.to(self.device)
+            y_local = y_local.to(self.device)
+
+            # Get predictions (B, 3, 96, 96)
+            pred = self.model(x_local, x_global)
+
+            # Permute to (B, 96, 96, 3)
+            pred = pred.permute(0, 2, 3, 1).contiguous()
+            y_local = y_local.permute(0, 2, 3, 1).contiguous()
+
+            # Normalization: inverse transform
+            pred = self.y_normalizer.inverse_transform(pred)
+            y_true = self.y_normalizer.inverse_transform(y_local)
+
+            y_preds.append(pred.cpu().numpy())
+            y_trues.append(y_true.cpu().numpy())
+
+        return np.concatenate(y_trues, axis=0), np.concatenate(y_preds, axis=0)
 
 class RVEVisualizer:
     """
     Class to visualize and compare Ground-Truth (FEM) results 
-    against model predictions (ML).
+    against model predictions (FNO).
     """
     
     @staticmethod
     def plot_cross_sections(y_true, y_pred, index, hline=None, vline=None, variable='Stress'):
         """
         Plots values along horizontal and vertical cross-sectional lines.
-        Adapts dynamically to the RVE grid size.
         """
         tt = y_true[index]  # FEM
-        zz = y_pred[index]  # ML
+        zz = y_pred[index]  # FNO
         
-        # Get grid size dynamically (e.g., 96)
+        # Get grid size
         L_x, L_y = tt.shape[0], tt.shape[1]
         
         # If no cut lines are specified, take the center of the RVE
@@ -777,14 +771,14 @@ class RVEVisualizer:
         lt33_v, lz33_v = tt[:, vline, 2], zz[:, vline, 2]
         vertical = np.array([[lt11_v, lz11_v], [lt22_v, lz22_v], [lt33_v, lz33_v]])
 
-        fig, ax = plt.subplots(3, 2, figsize=(20, 27))
+        fig, ax = plt.subplots(3, 2, figsize=(15, 21))
         x_axis_hor = np.arange(L_x)
         x_axis_ver = np.arange(L_y)
 
         for i in range(ax.shape[0]):
             # Horizontal Plots
-            ax[i, 0].plot(x_axis_hor, horizontal[i][0], linewidth=6, color='red', label='FEM-Hor')      
-            ax[i, 0].plot(x_axis_hor, horizontal[i][1], linewidth=4, color='black', label='ML-Hor', linestyle='dashed')
+            ax[i, 0].plot(x_axis_hor, horizontal[i][0], linewidth=4, color='red', label='FEM')      
+            ax[i, 0].plot(x_axis_hor, horizontal[i][1], linewidth=4, color='black', label='DualEncoderFNO', linestyle='dashed')
 
             ax[i, 0].xaxis.set_tick_params(which='major', size=10, width=3, direction='in', top=True)
             ax[i, 0].xaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', top=True)
@@ -802,8 +796,8 @@ class RVEVisualizer:
             ax[i, 0].legend()
  
             # Vertical Plots
-            ax[i, 1].plot(x_axis_ver, vertical[i][0], linewidth=6, color='red', label='FEM-Vert')  
-            ax[i, 1].plot(x_axis_ver, vertical[i][1], linewidth=4, color='black', label='ML-Vert', linestyle='dashed')
+            ax[i, 1].plot(x_axis_ver, vertical[i][0], linewidth=4, color='red', label='FEM')  
+            ax[i, 1].plot(x_axis_ver, vertical[i][1], linewidth=4, color='black', label='DualEncoderFNO', linestyle='dashed')
 
             ax[i, 1].xaxis.set_tick_params(which='major', size=10, width=3, direction='in', top=True)
             ax[i, 1].xaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', top=True)
@@ -857,7 +851,7 @@ class RVEVisualizer:
             # Prediction (Right)
             axx2 = ax[j, 1]
             pcm2 = axx2.pcolormesh(xcor, ycor, y_pred[index][:, :, j], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
-            axx2.set_title(f'FNO ML - Component {j+1}', fontsize=16)
+            axx2.set_title(f'DualEncoderFNO - Component {j+1}', fontsize=16)
             axx2.set_yticklabels([])
             axx2.set_xticklabels([])
             axx2.xaxis.set_tick_params(width=0)
