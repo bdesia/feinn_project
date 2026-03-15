@@ -3,7 +3,13 @@ CEIA FIUBA - Final Project - Finite Element-Integrated Neural Network framework
 
 ## About this project
 
-The FEINN framework integrates finite element methods with neural networks to create a hybrid approach for solving partial differential equations (PDEs) and other computationally intensive problems. This project aims to leverage the strengths of FEM for spatial discretization and neural networks for adaptive learning, enabling efficient and accurate solutions for engineering and physics-based applications.
+This repository explores the application of deep learning techniques for the resolution of solid mechanics problems.
+
+It is divided in two stages:
+
+1. The FEINN framework integrates finite element methods with neural networks to create a hybrid approach for solving partial differential equations (PDEs) and other computationally intensive problems. This project aims to leverage the strengths of FEM for spatial discretization and neural networks for adaptive learning, enabling efficient and accurate solutions for engineering and physics-based applications.
+
+1. Devolpment of a data-driven Fourier Neural Operator (FNO) to be used as a subrogate constitutive material model for multiscale simulations. Training data is generated from finite element simulations.
 
 This project was developed as part of the CEIA (Curso de Especialización en Inteligencia Artificial) at FIUBA (Facultad de Ingeniería, Universidad de Buenos Aires).
 
@@ -12,11 +18,15 @@ This project was developed as part of the CEIA (Curso de Especialización en Int
 The project was structured as follows. 
 
 ```
-├── data                                # Data. Here must be FE results used as ground-truth
-├── notebooks                           # Jupyter notebooks for interactive data analysis or modeling 
-│   └── tests                           # Sub-folder of notebooks used for code testing
+├── notebooks                           # Jupyter notebooks for interactive data analysis or modelling 
+│   ├── FEINN_example N                 # Sub-folder of notebooks used for FEINN approach testing case N
+│   └── RVE_data_generation             # Sub-folder of notebooks used for FNO subrogate model.
+│       ├── checkpoints                 # Here you must find HPO data and trained model configuration.
+│       ├── data                        # Finite-Element solutions for training model. One file per case.
+│       ├── master_data                 # Whole dataset in a single file, divided in train/val/test, with normalizers stats.
+│       ├── meshes                      # FE meshes for data generation.
+│       └── strain_histories            # Synthetic generated strain paths for data generation.
 └── src                                 # Main source of the project
-    └── tests                           # Unit tests for all the packages in the source code
 ```
 
 ## Prerequisites
@@ -37,6 +47,7 @@ Follow this steps:
     ```
 
     This script will execute poetry for installing all the dependencies and create a virtual environment. This script will aslso setup your `PYTHONPATH` by creating a `pth` file in the project virtual environment.
+    Before running, you must set device for PyTorch installation (choose between `cuda` or `cpu`). Default: `cuda` version.
 1. Activate the poetry environment (just in case):
 
     ```bash
@@ -57,6 +68,6 @@ Follow this steps:
 ### 2nd Part: FNO for Multi-scale in Solid Mechanics
 - ✅ Strain history generation using Gaussin Process with RBF kernel.
 - ✅ Synthethic data generation via FEM.
-- ⬜ FNO subrrogate model implementation.
+- ✅ FNO subrrogate model implementation.
 - ⬜ Integration of FNO subrrogate model into macro solver.
 - ⬜ Benchmark cases
