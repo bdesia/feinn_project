@@ -26,6 +26,10 @@ class MaterialBase(ABC):
         """Update device and dtype of the material."""
         if dtype: self.dtype = dtype
         if device: self.device = device
+        
+        for attr_name, attr_value in vars(self).items():
+            if isinstance(attr_value, torch.Tensor):
+                setattr(self, attr_name, attr_value.to(dtype=self.dtype, device=self.device))
         return self
 
     def init_state(self, nelem: int, ngp2: int) -> torch.Tensor:
