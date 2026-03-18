@@ -16,12 +16,18 @@ class MaterialBase(ABC):
     """
     def __init__(self, n_state: int = 0, 
                  dtype: torch.dtype = torch.float64, 
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 tag: int = None):
         
         self.n_state = n_state
         self.dtype = dtype
         self.device = device
+        self.tag = tag
 
+    def set_tag(self, tag):
+        self.tag = tag
+        return self
+    
     def to(self, dtype=None, device=None):
         """Update device and dtype of the material."""
         if dtype: self.dtype = dtype
@@ -225,5 +231,88 @@ class NexpElastic(MaterialBase):
         if isTangent:
             # Corrección: C ya tiene dimensiones (..., 3, 3), no requiere .view().expand()
             ddsdde = self.get_constitutive_matrix(strain) 
+
+        return stress, state_old, ddsdde
+
+class NLElasticMatrix(MaterialBase):
+    """
+    Non-linear isotropic elastic material for the matrix
+    Stress tensor: T = Km (tr E) I + Gm(E^D) E^D
+    with Gm(E^D) = α₁ / (α₂ + ||E^D||₂)
+    
+    Plane strain assumption (2D), Voigt notation: [ε_xx, ε_yy, 2ε_xy].
+    """
+
+    def __init__(self, Km: float, alpha1: float, alpha2: float):
+        super().__init__(n_state=0)
+
+        if Km <= 0 or alpha1 <= 0:
+            raise ValueError("Km and alpha1 must be positive.")
+        if alpha2 < 0:
+            raise ValueError("alpha2 must be non-negative.")
+
+        self.Km = Km
+        self.alpha1 = alpha1
+        self.alpha2 = alpha2
+
+        self.P = torch.tensor([[2/3., -1/3., 0.0],
+                               [-1/3., 2/3., 0.0],
+                               [0.0,   0.0,  0.5]],
+                              dtype=self.dtype, device=self.device)
+        
+        self.vol_matrix = torch.tensor([[1.0, 1.0, 0.0],
+                                        [1.0, 1.0, 0.0],
+                                        [0.0, 0.0, 0.0]],
+                                       dtype=self.dtype, device=self.device)
+
+    def _get_kinematics(self, strain: torch.Tensor):
+        """Calculates volumetric strain, deviatoric components, ||E^D||₂ and Gm."""
+        exx, eyy, gxy = strain.unbind(-1)
+        tre = exx + eyy
+        em = tre / 3.0
+
+        edxx = exx - em
+        edyy = eyy - em
+        edxy = gxy / 2.0
+
+        # ||E^D||₂ (Frobenius norm including ε_zz = 0)
+        normED_sq = edxx**2 + edyy**2 + em**2 + 2 * edxy**2
+        normED = torch.sqrt(normED_sq + 1e-24)
+
+        Gm = self.alpha1 / (self.alpha2 + normED)
+
+        return tre, edxx, edyy, edxy, normED, Gm
+
+    def get_constitutive_matrix(self, strain: torch.Tensor) -> torch.Tensor:
+        """Consistent tangent stiffness matrix (analytical)."""
+        tre, edxx, edyy, edxy, normED, Gm = self._get_kinematics(strain)
+
+        # Derivative terms
+        dGm_dn = -Gm / (self.alpha2 + normED + 1e-12)
+        gamma = dGm_dn / (normED + 1e-12)          # = (dGm/dn) / n
+
+        ed_v = torch.stack([edxx, edyy, edxy], dim=-1)
+        outer = ed_v.unsqueeze(-1) * ed_v.unsqueeze(-2)
+
+        C_dev = (Gm.unsqueeze(-1).unsqueeze(-1) * self.P +
+                 gamma.unsqueeze(-1).unsqueeze(-1) * outer)
+        
+        C_vol = self.Km * self.vol_matrix
+
+        return C_vol + C_dev
+
+    def update_state(self, strain, state_old, isTangent=True):
+        tre, edxx, edyy, edxy, _, Gm = self._get_kinematics(strain)
+
+        hydro = self.Km * tre
+        sxx = hydro + Gm * edxx
+        syy = hydro + Gm * edyy
+        sxy = Gm * edxy
+
+        stress = torch.stack([sxx, syy, sxy], dim=-1)
+
+        ddsdde = None
+        if isTangent:
+            ddsdde = self.get_constitutive_matrix(strain)
 
         return stress, state_old, ddsdde
