@@ -17,8 +17,8 @@ class MaterialBase(ABC):
     def __init__(self, n_state: int = 0, 
                  dtype: torch.dtype = torch.float64, 
                  device: str = 'cpu',
-                 tag: int = None):
-        
+                 tag: Optional[int] = None):
+
         self.n_state = n_state
         self.dtype = dtype
         self.device = device
@@ -60,8 +60,8 @@ class LinearElastic(MaterialBase):
 
     Uses Voigt notation: strain/stress vector = [ε_xx, ε_yy, 2ε_xy].
     """
-    def __init__(self, emod: float, nu: float):
-        super().__init__(n_state=0)
+    def __init__(self, emod: float, nu: float, tag: Optional[int] = None, **kwargs):
+        super().__init__(n_state=0, tag=tag, **kwargs)
         """
         Parameters
         ----------
@@ -109,15 +109,14 @@ class LinearElastic(MaterialBase):
         
         return stress, state_old, ddsdde
 
-
 class LinearElasticPlaneStress(MaterialBase):
     """
     Linear isotropic elastic material under plane stress assumption (2D).
 
     Uses Voigt notation: strain/stress vector = [ε_xx, ε_yy, 2ε_xy].
     """
-    def __init__(self, emod: float, nu: float):
-        super().__init__(n_state=0)
+    def __init__(self, emod: float, nu: float, tag: Optional[int] = None, **kwargs):
+        super().__init__(n_state=0, tag=tag, **kwargs)
         """
         Parameters
         ----------
@@ -162,8 +161,8 @@ class NexpElastic(MaterialBase):
     Voigt notation: [ε_xx, ε_yy, 2ε_xy]
     """
 
-    def __init__(self, k: float, e0: float, s0: float, m: float):
-        super().__init__(n_state=0)
+    def __init__(self, k: float, e0: float, s0: float, m: float, tag: Optional[int] = None, **kwargs):
+        super().__init__(n_state=0, tag=tag, **kwargs)
 
         if k <= 0 or e0 <= 0 or s0 <= 0:
             raise ValueError("k, e0, s0 must be positive.")
@@ -243,8 +242,8 @@ class NLElasticMatrix(MaterialBase):
     Plane strain assumption (2D), Voigt notation: [ε_xx, ε_yy, 2ε_xy].
     """
 
-    def __init__(self, Km: float, alpha1: float, alpha2: float):
-        super().__init__(n_state=0)
+    def __init__(self, Km: float, alpha1: float, alpha2: float, tag: Optional[int] = None, **kwargs):
+        super().__init__(n_state=0, tag=tag, **kwargs)
 
         if Km <= 0 or alpha1 <= 0:
             raise ValueError("Km and alpha1 must be positive.")
