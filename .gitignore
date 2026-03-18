@@ -14,8 +14,8 @@ __pycache__/
 htmlcov/
 
 # RVE training data
-notebooks/RVE_data_generation/meshes/*
-notebooks/RVE_data_generation/strain_histories/*
-notebooks/RVE_data_generation/data/*
-notebooks/RVE_data_generation/master_data/*
-notebooks/RVE_data_generation/wandb/*
+notebooks/RVEs/meshes/*
+notebooks/RVEs/strain_histories/*
+notebooks/RVEs/data/*
+notebooks/RVEs/master_data/*
+notebooks/RVEs/wandb/*
