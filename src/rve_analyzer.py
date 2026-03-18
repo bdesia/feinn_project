@@ -745,12 +745,28 @@ class RVEVisualizer:
     """
     
     @staticmethod
-    def plot_cross_sections(y_true, y_pred, index, hline=None, vline=None, variable='Stress'):
+    def plot_cross_sections(phase, y_true, y_pred, index, hline=None, vline=None, variable='Stress'):
         """
-        Plots values along horizontal and vertical cross-sectional lines.
+        Plots values along horizontal and vertical cross-sectional lines in a 2x3 grid.
+        Row 1: Horizontal cross-section (varying X).
+        Row 2: Vertical cross-section (varying Y).
+        Columns: Tensor components (XX, YY, XY).
+        Also overlays the inverted input phase as a shaded background.
+
+        Args:
+            phase (ndarray): Input phase data (batch_size, H, W, ...).
+            y_true (ndarray): Ground truth tensor (batch_size, H, W, 3).
+            y_pred (ndarray): Predicted tensor (batch_size, H, W, 3).
+            index (int): Index of the sample to visualize.
+            hline (int, optional): Y-index for the horizontal cut. Defaults to center.
+            vline (int, optional): X-index for the vertical cut. Defaults to center.
+            variable (str): Label for the Y-axis. Defaults to 'Stress'.
         """
         tt = y_true[index]  # FEM
         zz = y_pred[index]  # FNO
+        
+        # INVERTIMOS LA FASE AQUÍ (1 - fase)
+        ph = 1.0 - phase[index].squeeze() 
         
         # Get grid size
         L_x, L_y = tt.shape[0], tt.shape[1]
@@ -759,112 +775,159 @@ class RVEVisualizer:
         if hline is None: hline = L_y // 2
         if vline is None: vline = L_x // 2
 
-        # Extract horizontal lines
-        lt11, lz11 = tt[hline, :, 0], zz[hline, :, 0]
-        lt22, lz22 = tt[hline, :, 1], zz[hline, :, 1]
-        lt33, lz33 = tt[hline, :, 2], zz[hline, :, 2]
-        horizontal = np.array([[lt11, lz11], [lt22, lz22], [lt33, lz33]])
+        # --- Extract Lines ---
+        # Horizontal lines (varying X, constant Y = hline)
+        hor_true = [tt[:, hline, i] for i in range(3)]
+        hor_pred = [zz[:, hline, i] for i in range(3)]
+        hor_phase = ph[:, hline]
 
-        # Extract vertical lines
-        lt11_v, lz11_v = tt[:, vline, 0], zz[:, vline, 0]
-        lt22_v, lz22_v = tt[:, vline, 1], zz[:, vline, 1]
-        lt33_v, lz33_v = tt[:, vline, 2], zz[:, vline, 2]
-        vertical = np.array([[lt11_v, lz11_v], [lt22_v, lz22_v], [lt33_v, lz33_v]])
+        # Vertical lines (varying Y, constant X = vline)
+        ver_true = [tt[vline, :, i] for i in range(3)]
+        ver_pred = [zz[vline, :, i] for i in range(3)]
+        ver_phase = ph[vline, :]
 
-        fig, ax = plt.subplots(3, 2, figsize=(15, 21))
+        # Create 2x3 grid
+        fig, ax = plt.subplots(2, 3, figsize=(21, 10))
         x_axis_hor = np.arange(L_x)
         x_axis_ver = np.arange(L_y)
+        
+        comp_labels = [r'$\sigma_{xx}$', r'$\sigma_{yy}$', r'$\sigma_{xy}$']
 
-        for i in range(ax.shape[0]):
-            # Horizontal Plots
-            ax[i, 0].plot(x_axis_hor, horizontal[i][0], linewidth=4, color='red', label='FEM')      
-            ax[i, 0].plot(x_axis_hor, horizontal[i][1], linewidth=4, color='black', label='DualEncoderFNO', linestyle='dashed')
-
-            ax[i, 0].xaxis.set_tick_params(which='major', size=10, width=3, direction='in', top=True)
-            ax[i, 0].xaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', top=True)
-            ax[i, 0].yaxis.set_tick_params(which='major', size=10, width=3, direction='in', right=True)
-            ax[i, 0].yaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', right=True)
+        for j in range(3): # Iterate over columns (components)
             
-            ax[i, 0].yaxis.set_major_locator(ticker.MaxNLocator(6))
-            ax[i, 0].xaxis.set_minor_locator(AutoMinorLocator())
-            ax[i, 0].yaxis.set_minor_locator(AutoMinorLocator())
-            ax[i, 0].yaxis.set_label_coords(-.1, .5)
+            # ==========================================
+            # Row 0: Horizontal Plots (Cross-section X)
+            # ==========================================
+            ax0 = ax[0, j]
             
-            ax[i, 0].set_xlabel('Grid X', labelpad=20) 
-            ax[i, 0].set_ylabel(f'{variable} Component {i+1}', labelpad=20)
-            ax[i, 0].set_xlim(0, L_x - 1)
-            ax[i, 0].legend()
- 
-            # Vertical Plots
-            ax[i, 1].plot(x_axis_ver, vertical[i][0], linewidth=4, color='red', label='FEM')  
-            ax[i, 1].plot(x_axis_ver, vertical[i][1], linewidth=4, color='black', label='DualEncoderFNO', linestyle='dashed')
-
-            ax[i, 1].xaxis.set_tick_params(which='major', size=10, width=3, direction='in', top=True)
-            ax[i, 1].xaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', top=True)
-            ax[i, 1].yaxis.set_tick_params(which='major', size=10, width=3, direction='in', right=True)
-            ax[i, 1].yaxis.set_tick_params(which='minor', size=5, width=1.5, direction='in', right=True)
+            # 1. Plot Phase Background
+            ax0_phase = ax0.twinx()
+            ax0_phase.fill_between(x_axis_hor, 0, hor_phase, color='gray', alpha=0.3, step='mid', label='Phase')
+            ax0_phase.set_ylim(0, 1) # Assuming phase is 0 or 1
+            ax0_phase.set_yticks([]) # Hide secondary Y axis ticks
             
-            ax[i, 1].yaxis.set_major_locator(ticker.MaxNLocator(6))
-            ax[i, 1].xaxis.set_minor_locator(AutoMinorLocator())
-            ax[i, 1].yaxis.set_minor_locator(AutoMinorLocator())
-            ax[i, 1].yaxis.set_label_coords(-.12, .5)
+            # 2. Plot True and Pred
+            l1 = ax0.plot(x_axis_hor, hor_true[j], linewidth=3, color='red', label='FEM')      
+            l2 = ax0.plot(x_axis_hor, hor_pred[j], linewidth=3, color='black', label='DualEncoderFNO', linestyle='dashed')
 
-            ax[i, 1].set_xlabel('Grid Y', labelpad=15) 
-            ax[i, 1].set_ylabel(f'{variable} Component {i+1}', labelpad=15)
-            ax[i, 1].set_xlim(0, L_y - 1)
-            ax[i, 1].legend()
+            # Formatting
+            ax0.set_title(f'{variable} {comp_labels[j]}', fontsize=18, pad=15)
+            ax0.set_xlabel(f'Cross-section X ($Y={hline}$)', fontsize=14, labelpad=10) 
+            ax0.set_ylabel(f'{comp_labels[j]} [MPa]', fontsize=14, labelpad=10)
+            ax0.set_xlim(0, L_x - 1)
+            
+            # Combine legends from both axes
+            if j == 0:
+                lines, labels = ax0.get_legend_handles_labels()
+                lines2, labels2 = ax0_phase.get_legend_handles_labels()
+                ax0.legend(lines + lines2, labels + labels2, loc='upper right', fontsize=12)
+
+            # Tick formatting
+            ax0.xaxis.set_tick_params(which='major', size=8, width=2, direction='in', top=True)
+            ax0.xaxis.set_tick_params(which='minor', size=4, width=1, direction='in', top=True)
+            ax0.yaxis.set_tick_params(which='major', size=8, width=2, direction='in', right=True)
+            ax0.yaxis.set_tick_params(which='minor', size=4, width=1, direction='in', right=True)
+            ax0.yaxis.set_major_locator(ticker.MaxNLocator(6))
+            ax0.xaxis.set_minor_locator(AutoMinorLocator())
+            ax0.yaxis.set_minor_locator(AutoMinorLocator())
+
+
+            # ==========================================
+            # Row 1: Vertical Plots (Cross-section Y)
+            # ==========================================
+            ax1 = ax[1, j]
+            
+            # 1. Plot Phase Background
+            ax1_phase = ax1.twinx()
+            ax1_phase.fill_between(x_axis_ver, 0, ver_phase, color='gray', alpha=0.3, step='mid')
+            ax1_phase.set_ylim(0, 1)
+            ax1_phase.set_yticks([])
+            
+            # 2. Plot True and Pred
+            ax1.plot(x_axis_ver, ver_true[j], linewidth=3, color='red', label='FEM')  
+            ax1.plot(x_axis_ver, ver_pred[j], linewidth=3, color='black', label='DualEncoderFNO', linestyle='dashed')
+
+            # Formatting
+            ax1.set_xlabel(f'Cross-section Y ($X={vline}$)', fontsize=14, labelpad=10) 
+            ax1.set_ylabel(f'{comp_labels[j]} [MPa]', fontsize=14, labelpad=10)
+            ax1.set_xlim(0, L_y - 1)
+            
+            if j == 0:
+                ax1.legend(loc='upper right', fontsize=12)
+
+            # Tick formatting
+            ax1.xaxis.set_tick_params(which='major', size=8, width=2, direction='in', top=True)
+            ax1.xaxis.set_tick_params(which='minor', size=4, width=1, direction='in', top=True)
+            ax1.yaxis.set_tick_params(which='major', size=8, width=2, direction='in', right=True)
+            ax1.yaxis.set_tick_params(which='minor', size=4, width=1, direction='in', right=True)
+            ax1.yaxis.set_major_locator(ticker.MaxNLocator(6))
+            ax1.xaxis.set_minor_locator(AutoMinorLocator())
+            ax1.yaxis.set_minor_locator(AutoMinorLocator())
 
         plt.tight_layout()
         plt.show()
     
     @staticmethod
-    def plot_contours(y_true, y_pred, index, xcor=None, ycor=None, cmap='Reds'):
+    def plot_contours(phase, y_true, y_pred, index, channel=0, xcor=None, ycor=None, cmap='viridis', title= None):
         """
-        Component-wise contour map comparing Ground Truth (Left) vs FNO (Right).
+        Plots a 1x3 grid comparing the input phase, ground truth, and model prediction.
+
+        Args:
+            phase (ndarray): Input phase data (batch_size, H, W, ...).
+            y_true (ndarray): Ground truth tensor (batch_size, H, W, num_components).
+            y_pred (ndarray): Predicted tensor (batch_size, H, W, num_components).
+            index (int): Index of the sample to visualize.
+            channel (int): Channel to plot (0-based index). Defaults to 0.
+            xcor (ndarray, optional): X-coordinates grid. Defaults to None.
+            ycor (ndarray, optional): Y-coordinates grid. Defaults to None.
+            cmap (str): Colormap for the output fields. Defaults to 'viridis'.
         """
-        R = y_pred[index].shape[-1]
+        # Convert to 0-based index (e.g., Component 1 -> index 0)
+        c_idx = channel 
         
         # Generate coordinates if not provided
         if xcor is None or ycor is None:
             L_x, L_y = y_true[index].shape[0], y_true[index].shape[1]
             xcor, ycor = np.meshgrid(np.arange(L_x), np.arange(L_y), indexing='ij')
 
-        fig, ax = plt.subplots(R, 2, figsize=(16, 7 * (R + 0.5)))
+        fig, ax = plt.subplots(1, 3, figsize=(12, 4))
         
-        comb = [y_pred[index], y_true[index]]
+        # Min/max bounds for the selected component (Ground Truth & Prediction)
+        comb = [y_pred[index][:, :, c_idx], y_true[index][:, :, c_idx]]
         _min, _max = np.min(comb), np.max(comb)
-        cbarwidth = 0.03
 
-        for j in range(R):
-            # Ground Truth (Left)
-            ax1 = ax[j, 0]
-            pl1 = ax1.pcolormesh(xcor, ycor, y_true[index][:, :, j], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
-            ax1.set_title(f'FEM - Component {j+1}', fontsize=16)
-            ax1.set_yticklabels([])
-            ax1.set_xticklabels([])
-            ax1.xaxis.set_tick_params(width=0)
-            ax1.yaxis.set_tick_params(width=0)
-            ax1.set_aspect('equal')
-            for spine in ax1.spines.values():
-                spine.set_linewidth(3)
+        # Left: Input Phase
+        ax[0].pcolormesh(xcor, ycor, phase[index].squeeze(), cmap='gray', shading='auto')
+        ax[0].set_title('Phase map', fontsize=12)
 
-            # Prediction (Right)
-            axx2 = ax[j, 1]
-            pcm2 = axx2.pcolormesh(xcor, ycor, y_pred[index][:, :, j], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
-            axx2.set_title(f'DualEncoderFNO - Component {j+1}', fontsize=16)
-            axx2.set_yticklabels([])
-            axx2.set_xticklabels([])
-            axx2.xaxis.set_tick_params(width=0)
-            axx2.yaxis.set_tick_params(width=0)
-            axx2.set_aspect('equal')
-            for spine in axx2.spines.values():
-                spine.set_linewidth(3)
+        # Center: Ground Truth (FEM)
+        ax[1].pcolormesh(xcor, ycor, y_true[index][:, :, c_idx], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
+        ax[1].set_title(f'FEM', fontsize=12)
 
-        # Global colorbar
-        pos1 = ax[0, 1].get_position()
-        cax = fig.add_axes([0.94, 0.15, cbarwidth, 0.7])
-        colorbar = plt.colorbar(pl1, cax=cax)
-        colorbar.ax.tick_params(labelsize=20) 
-        colorbar.outline.set_linewidth(3)
-        
+        # Right: Prediction (DualEncoderFNO)
+        pcm_pred = ax[2].pcolormesh(xcor, ycor, y_pred[index][:, :, c_idx], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
+        ax[2].set_title(f'DualEncoderFNO', fontsize=12)
+
+        # Global formatting
+        for i in range(3):
+            ax[i].set_yticklabels([])
+            ax[i].set_xticklabels([])
+            ax[i].xaxis.set_tick_params(width=0)
+            ax[i].yaxis.set_tick_params(width=0)
+            ax[i].set_aspect('equal')
+            for spine in ax[i].spines.values():
+                spine.set_linewidth(1)
+
+        # Global colorbar for Center and Right plots
+        plt.tight_layout()
+        fig.subplots_adjust(right=0.9) 
+        cax = fig.add_axes([0.92, 0.15, 0.02, 0.7]) 
+        colorbar = plt.colorbar(pcm_pred, cax=cax)
+        colorbar.ax.tick_params(labelsize=12) 
+        colorbar.outline.set_linewidth(1)
+        colorbar.set_label('[MPa]', fontsize=12)
+
+        if title is None:
+            title = f'FNO predictions - Channel {channel}'
+        fig.suptitle(title, y=1.1)
         plt.show()
