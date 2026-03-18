@@ -160,10 +160,9 @@ class BaseSolver:
 
             batch._assign_nodal_coordinates(self.coords_tensor)
             batch._precompute_constants()
-            batch.material.vectorize(nelem=batch.nelem, ngp2=batch.ngp2)        # Prepare material for vectorized evaluation
-            #batch.material.to(dtype=self.dtype, device=self.device)            # Move material to correct dtype/device
+            batch.material.to(dtype=self.dtype, device=self.device)                 # Move material to correct dtype/device
             self.quad_batches[group_name] = batch
-            self.nelem += batch.nelem                                            # Cumulative number of elements
+            self.nelem += batch.nelem                                               # Cumulative number of elements
 
         if self.verbose:
             print(f"[matfld] Assigned: {list(matfld.keys())}")
@@ -294,7 +293,10 @@ class BaseSolver:
             batch._precompute_constants()
             f_body = batch.compute_body_loads(load.tensor.to(dtype=self.dtype, device=self.device))
             dofs = batch.dofs
-            self.Fext_total[dofs] += f_body
+            # self.Fext_total[dofs] += f_body
+            dofs_flat = dofs.reshape(-1)
+            f_body_flat = f_body.reshape(-1)
+            self.Fext_total.index_add_(0, dofs_flat, f_body_flat)
 
         if self.verbose:
             print(f"[body_load] Applied {len(self.body_loads)} body load groups")
@@ -321,7 +323,10 @@ class BaseSolver:
             batch._precompute_constants()
             f_edge = batch.compute_edge_loads(load.side, load.tensor.to(dtype=self.dtype, device=self.device), load.reference)
             dofs = batch.dofs
-            self.Fext_total[dofs] += f_edge
+            # self.Fext_total[dofs] += f_edge
+            dofs_flat = dofs.reshape(-1)
+            f_edge_flat = f_edge.reshape(-1)
+            self.Fext_total.index_add_(0, dofs_flat, f_edge_flat)
 
         if self.verbose:
             print(f"[edge_load] Applied {len(self.edge_loads)} edge load groups")
@@ -390,8 +395,7 @@ class BaseSolver:
             raise ValueError("Invalid formulation. Must be 'infinitesimal' or 'TLF'.")
 
         all_fint = torch.empty(0, dtype=self.dtype, device=self.device)
-        if self.quad_batches:
-            all_fint = torch.cat([compute_f(batch).view(-1) for batch in self.quad_batches.values()])
+        all_fint = torch.cat([compute_f(batch).view(-1) for batch in self.quad_batches.values()])
         Fint.scatter_add_(0, self.all_dofs_flat, all_fint)
 
         return Fint
@@ -655,26 +659,45 @@ class NFEA(BaseSolver):
     def _set_dtype(self):
         self.dtype = torch.float64
 
-    def _assemble_stiffness(self, Kbase: torch.Tensor = None) -> torch.Tensor:
+    def _assemble_internal_and_stiffness(self, 
+        u: torch.Tensor = None, 
+        Fbase: torch.Tensor = None,
+        Kbase: torch.Tensor = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Assemble global stiffness matrix
+        Assemble global internal forces and vector global stiffness matrix
         """
+        u = self.udisp if u is None else u
+        if Fbase is not None:
+            Fint = Fbase.clone()
+        else:
+            Fint = torch.zeros(self.ndof, dtype=self.dtype, device=self.device)
         if Kbase is not None:
             K = Kbase.clone()
         else:
             K = torch.zeros(self.ndof, self.ndof, dtype=self.dtype, device=self.device)
+        
+        if self.formulation == 'infinitesimal':
+            compute_batch = lambda batch: batch.compute_linear_intfor_and_stiff(u)
+        elif self.formulation == 'TLF':
+            compute_batch = lambda batch: batch.compute_nonlinear_intfor_and_stiff(u)
+        else:
+            raise ValueError("Invalid formulation. Must be 'infinitesimal' or 'TLF'.")
+      
+        batches = list(self.quad_batches.values())
+        fints, Ks = zip(*[compute_batch(b) for b in batches])
 
-        compute_Ke = (
-            lambda batch: batch.compute_linear_stiff()
-            if self.formulation == 'infinitesimal' else
-            batch.compute_nonlinear_stiff(self.udisp)
-        )
-
-        all_Ke = torch.cat([compute_Ke(batch).reshape(-1) for batch in self.quad_batches.values()])
+        # K-assemble
+        all_Ke = torch.cat([k.reshape(-1) for k in Ks])
         K.view(-1).scatter_add_(0, self.all_i_flat * self.ndof + self.all_j_flat, all_Ke)
 
-        return K
-    
+        # Fint-assemble
+        all_fint = torch.cat([f.reshape(-1) for f in fints])
+        all_dofs = torch.cat([b.dofs.reshape(-1) for b in batches])
+        Fint.scatter_add_(0, all_dofs, all_fint)
+
+        return Fint, K
+
     def update_mpc_b0s(self):
         if self.mpc_C_matrix is not None and self.mpcs is not None:
             self.mpc_b0s = torch.tensor(
@@ -700,9 +723,8 @@ class NFEA(BaseSolver):
         Kpenal = None           # Inicialization of penalty stiffness matrix for MPCs (if any)
         Fpenal = None           # Inicialization of penalty force vector for MPCs (if any)
 
-        du = torch.zeros_like(self.udisp)               # Displacement increment vector initialization
-        Ktan = self._assemble_stiffness()               # Tangent stiffness matrix initialization
-        Fint = self._assemble_internal_forces()         # Internal force vector initalization
+        du = torch.zeros_like(self.udisp)                       # Displacement increment vector initialization
+        Fint, Ktan  = self._assemble_internal_and_stiffness()   # Tangent stiffness matrix & Internal force vector initialization
         
         if self.mpc_C_matrix is not None:
             maxK0 = torch.max(torch.abs(Ktan)).item()
@@ -738,8 +760,11 @@ class NFEA(BaseSolver):
 
             self.udisp[self.free_dofs] += du[self.free_dofs]                # Update displacement vector for the n-step of time  
 
-            Ktan = self._assemble_stiffness(Kbase=Kpenal)                   # Update tangent stiffness matrix
-            Fint = self._assemble_internal_forces(Fbase=Fpenal)             # Update internal force vector
+            Fint, Ktan  = self._assemble_internal_and_stiffness(             # Update tangent stiffness matrix & internal force vector
+                                    Fbase=Fpenal,
+                                    Kbase=Kpenal,                           
+                                )
+         
             if self.mpc_C_matrix is not None:
                  Fint += Kpenal @ self.udisp 
             residual = self.Fext - Fint                                     # Update unbalanced forces vector at iteration "it" for the n-step of time                   
@@ -782,8 +807,6 @@ class NFEA(BaseSolver):
         else:
             print("MAXIMUM NUMBER OF ITERATIONS REACHED - NO CONVERGENCE")
             return False
-
-
 
 DEFAULT_NNET = torch.nn.Sequential(
     torch.nn.Linear(2, 64),

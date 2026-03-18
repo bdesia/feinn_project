@@ -173,6 +173,7 @@ class QuadElement(MasterElement):
         self.weighted_dV = None
         self.Bl0 = None
         self.ngp2 = None
+        self.state = None
     
     # --------------------------------------
     #  AUXILIARY METHODS
@@ -183,8 +184,12 @@ class QuadElement(MasterElement):
         self.r_gp, self.s_gp, weights = self._vectorized_gauss_points()
         self.ngp2 = self.r_gp.shape[0]
         self.dHdX, detJ = self.compute_jacobian(self.r_gp, self.s_gp)               # (nelem, ngp², 2, nnode), (nelem, ngp²)
-        self.Bl0 = self._compute_B_matrix_lin(self.r_gp, self.s_gp)                 # (nelem, ngp², 3, ndof_local)
+        self.Bl0 = self._compute_B_matrix_lin()                 # (nelem, ngp², 3, ndof_local)
         self.weighted_dV = weights.unsqueeze(0) * detJ * self.thickness             # (nelem, ngp²)
+
+        # Initialize material state variables
+        if self.material is not None:
+            self.state = self.material.init_state(self.nelem, self.ngp2)
 
     def compute_jacobian(self, r: torch.Tensor, s: torch.Tensor):   
         dHrs = QuadShapeDerivatives(r, s, self.nnode)                           # (ngp², 2, nnode)
@@ -207,18 +212,11 @@ class QuadElement(MasterElement):
 
         return dHdX, detJ
 
-    def _vectorized_material(self):
-        """Prepare the material for vectorized evaluation over nelem elements and npoints Gauss points per element."""
-        if self.material.is_vectorized:
-            return  # Already vectorized
-        else:
-            self.material.vectorize(self.nelem, self.ngp2)
-
     # --------------------------------------
     #  GEOMETRICALLY LINEAR METHODS
     # --------------------------------------
 
-    def _compute_B_matrix_lin(self, r: torch.Tensor, s: torch.Tensor):
+    def _compute_B_matrix_lin(self):
         Bl0 = torch.zeros(self.nelem, self.ngp2, 3, self.ndof_local, dtype=self.dtype,device=self.device)
         Bl0[:, :, 0, 0::2] = self.dHdX[:, :, 0, :]  # ∂N/∂x → ux
         Bl0[:, :, 1, 1::2] = self.dHdX[:, :, 1, :]  # ∂N/∂y → uy
@@ -231,17 +229,31 @@ class QuadElement(MasterElement):
         epsilon = torch.einsum('egij,ej->egi', self.Bl0, local_disp.view(self.nelem, self.ndof_local))  # (nelem, ngp², 3)
         return epsilon  # [nelem, ngp², 3] Voigt notation [exx, eyy, 2exy]
 
-    def compute_linear_stiff(self) -> torch.Tensor:
-        DDSDDE = self.material.get_constitutive_matrix().to(dtype=self.dtype, device=self.device)     # (nelem, ngp², 3, 3)
-        K_local = torch.einsum('egij, egik, egkl, eg -> ejl', self.Bl0, DDSDDE, self.Bl0, self.weighted_dV)
-        return K_local  # (nelem, ndof_local, ndof_local)
+    def _compute_linear_core(self, global_disp: torch.Tensor, isTangent: bool = True):
+        local_disp = self.get_local_disp(global_disp)                   # (nelem, nnode, 2)
+        strain = self.compute_infinitesimal_strain(local_disp)          # (nelem, ngp2, 3)
+
+        stress, self.state, ddsdde = self.material.update_state(        # (nelem, ngp², 3), (nelem, ngp², n_state), (nelem, ngp², 3, 3)    
+            strain, self.state, isTangent=isTangent
+        )
+
+        Fint_local = torch.einsum('egij,egi,eg->ej', self.Bl0, stress, self.weighted_dV)
+
+        if isTangent:
+            K_local = torch.einsum('egij,egik,egkl,eg->ejl',
+                              self.Bl0, ddsdde, self.Bl0, self.weighted_dV)
+            return Fint_local, K_local
+        return Fint_local, None
 
     def compute_linear_intfor(self, global_disp: torch.Tensor) -> torch.Tensor:
-        local_disp = self.get_local_disp(global_disp)                                                   # (nelem, nnode, 2)
-        epsilon = self.compute_infinitesimal_strain(local_disp)                                         # Usa precomputado
-        sigma_vec = self.material.compute_stress(epsilon).to(dtype=self.dtype, device=self.device)      # (nelem, ngp², 3)
-        Fint_local = torch.einsum('egij,egi,eg->ej', self.Bl0, sigma_vec, self.weighted_dV)
+        """Compute Fint only"""
+        Fint_local, _ = self._compute_linear_core(global_disp, isTangent=False)
         return Fint_local
+
+    def compute_linear_intfor_and_stiff(self, global_disp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Fint and Ke together"""
+        Fint_local, K_local = self._compute_linear_core(global_disp, isTangent=True)
+        return Fint_local, K_local
 
     # --------------------------------------
     #  GEOMETRICALLY NON-LINEAR METHODS: TOTAL LAGRANGIAN FORMULATION
@@ -276,41 +288,51 @@ class QuadElement(MasterElement):
 
         return Bl1, Bnl
 
-    def compute_nonlinear_stiff(self, global_disp: torch.Tensor) -> torch.Tensor:
-        local_disp = self.get_local_disp(global_disp)                           # (nelem, nnode, 2)
-        grad_u = self.compute_displacement_gradient(local_disp)
-        Bl1, Bnl = self._compute_B_matrix_nl(grad_u)
-        F = self.compute_deformation_gradient(grad_u)
-        # Material stiffness
-        Bl = self.Bl0 + Bl1
-        DDSDDE = self.material.get_constitutive_matrix().to(dtype=self.dtype, device=self.device)                # (nelem, ngp², 3,3)
-        Kmat_local = torch.einsum('egij, egik, egkl, eg -> ejl', Bl, DDSDDE, Bl, self.weighted_dV)
-        # Geometric stiffness
-        E_vec = self.compute_green_lagrange_strain(F)
-        S_vec = self.material.compute_pk2_stress(E_vec).to(dtype=self.dtype, device=self.device)
-        S_mat = torch.zeros(self.nelem, self.r_gp.shape[0], 4, 4, dtype=self.dtype, device=self.device)
-        S_mat[:, :, 0, 0] = S_vec[:, :, 0]
-        S_mat[:, :, 1, 1] = S_vec[:, :, 1]
-        S_mat[:, :, 0, 1] = S_mat[:, :, 1, 0] = S_vec[:, :, 2]
-        S_mat[:, :, 2, 2] = S_vec[:, :, 0]
-        S_mat[:, :, 3, 3] = S_vec[:, :, 1]
-        S_mat[:, :, 2, 3] = S_mat[:, :, 3, 2] = S_vec[:, :, 2]
-
-        Kgeo_local = torch.einsum('egij,egik,egkl,eg->ejl',
-                                  Bnl, S_mat, Bnl, self.weighted_dV)
-        K_local = Kmat_local + Kgeo_local
-        return K_local
-
-    def compute_nonlinear_intfor(self, global_disp: torch.Tensor) -> torch.Tensor:
+    def _compute_nonlinear_core(self, global_disp: torch.Tensor, isTangent: bool = True):
         local_disp = self.get_local_disp(global_disp)
         grad_u = self.compute_displacement_gradient(local_disp)
-        Bl1, _ = self._compute_B_matrix_nl(grad_u=grad_u)
+        Bl1, Bnl = self._compute_B_matrix_nl(grad_u=grad_u)
         Bl = self.Bl0 + Bl1
         F = self.compute_deformation_gradient(grad_u)
-        E_vec = self.compute_green_lagrange_strain(F)
-        pk2_vec = self.material.compute_pk2_stress(E_vec).to(dtype=self.dtype, device=self.device)  # (nelem, ngp², 3)
-        Fint_local = torch.einsum('egij,egi,eg->ej', Bl, pk2_vec, self.weighted_dV)
-        return Fint_local  # (nelem, ndof_local)
+        E_vec = self.compute_green_lagrange_strain(F)                   # Green-Lagrange strain
+
+        stress, self.state, ddsdde = self.material.update_state(
+            E_vec, self.state, isTangent=isTangent
+        )
+
+        # Internal force
+        Fint_local = torch.einsum('egij,egi,eg->ej', Bl, stress, self.weighted_dV)
+
+        if isTangent:
+            # Material stiffness
+            Kmat_local = torch.einsum('egij,egik,egkl,eg->ejl', Bl, ddsdde, Bl, self.weighted_dV)
+
+            # Geometric stiffness
+            S_mat = torch.zeros(self.nelem, self.ngp2, 4, 4, dtype=self.dtype, device=self.device)
+            S_mat[:, :, 0, 0] = stress[:, :, 0]
+            S_mat[:, :, 1, 1] = stress[:, :, 1]
+            S_mat[:, :, 0, 1] = S_mat[:, :, 1, 0] = stress[:, :, 2]
+            S_mat[:, :, 2, 2] = stress[:, :, 0]
+            S_mat[:, :, 3, 3] = stress[:, :, 1]
+            S_mat[:, :, 2, 3] = S_mat[:, :, 3, 2] = stress[:, :, 2]
+
+            Kgeo_local = torch.einsum('egij,egik,egkl,eg->ejl', Bnl, S_mat, Bnl, self.weighted_dV)
+
+            K_local = Kmat_local + Kgeo_local
+
+            return Fint_local, K_local,      # (nelem, ndof_local), (nelem, ndof_local, ndof_local)
+    
+        return Fint_local, None
+        
+    def compute_nonlinear_intfor(self, global_disp: torch.Tensor) -> torch.Tensor:
+        """Compute Fint only"""
+        Fint_local, _ = self._compute_nonlinear_core(global_disp, isTangent=False)
+        return Fint_local
+
+    def compute_nonlinear_intfor_and_stiff(self, global_disp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Ke and Fint together"""
+        Fint_local, K_local = self._compute_nonlinear_core(global_disp, isTangent=True)
+        return Fint_local, K_local
 
     # --------------------------------------
     #  EXTERNAL LOADS METHODS
@@ -326,7 +348,7 @@ class QuadElement(MasterElement):
         Fbody = torch.einsum('egji, ej, eg -> ei', Nshape, fvec, self.weighted_dV)
         return Fbody  # (nelem, ndof_local)
 
-    def compute_edge_load(self, sides: List[int], fsup: torch.Tensor, reference='local') -> torch.Tensor:
+    def compute_edge_loads(self, sides: List[int], fsup: torch.Tensor, reference='local') -> torch.Tensor:
         """
         Compute equivalent nodal forces due to edge traction (surface load).
         

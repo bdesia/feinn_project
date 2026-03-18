@@ -1,7 +1,6 @@
-from typing import Optional
 import torch
 from abc import ABC, abstractmethod
-
+from typing import Tuple, Optional
 
 class MaterialBase(ABC):
     """
@@ -15,30 +14,35 @@ class MaterialBase(ABC):
         Indicates whether the material is operating in vectorized mode
         (multiple elements and Gauss points simultaneously).
     """
+    def __init__(self, n_state: int = 0, 
+                 dtype: torch.dtype = torch.float64, 
+                 device: str = 'cpu'):
+        
+        self.n_state = n_state
+        self.dtype = dtype
+        self.device = device
 
-    def __init__(self, n_state: int = 0):
-        self.n_state: int = n_state
-        self.is_vectorized: bool = False
-        self.nelem: Optional[int] = None
-        self.ngp2: Optional[int] = None
+    def to(self, dtype=None, device=None):
+        """Update device and dtype of the material."""
+        if dtype: self.dtype = dtype
+        if device: self.device = device
+        return self
+
+    def init_state(self, nelem: int, ngp2: int) -> torch.Tensor:
+        """Initialize the state tensor."""
+        return torch.zeros((nelem, ngp2, self.n_state),
+                           device=self.device, dtype=self.dtype)
 
     @abstractmethod
-    def get_constitutive_matrix(self, *args, **kwargs) -> torch.Tensor:
-        """Return the constitutive (or algorithmic tangent) matrix."""
+    def update_state(
+        self,
+        strain: torch.Tensor,
+        state_old: torch.Tensor,
+        isTangent: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Return (stress, state_new, tangent). Tangent = None if isTangent=False."""
         pass
 
-    @abstractmethod
-    def compute_stress(self, *args, **kwargs) -> torch.Tensor:
-        """Compute stress and update internal variables."""
-        pass
-
-    def vectorize(self, nelem: int, ngp2: int):
-        """Prepare the material for vectorized evaluation over nelem elements and npoints Gauss points per element."""
-        if nelem <= 0 or ngp2 <= 0:
-            raise ValueError("nelem and ngp2 must be positive integers.")
-        self.nelem = nelem
-        self.ngp2 = ngp2
-        self.is_vectorized = True
 
 class LinearElastic(MaterialBase):
     """
@@ -47,7 +51,7 @@ class LinearElastic(MaterialBase):
     Uses Voigt notation: strain/stress vector = [ε_xx, ε_yy, 2ε_xy].
     """
     def __init__(self, emod: float, nu: float):
-        super().__init__()
+        super().__init__(n_state=0)
         """
         Parameters
         ----------
@@ -67,9 +71,9 @@ class LinearElastic(MaterialBase):
         # Pre-computed factors for plane strain constitutive matrix
         self._factor1 = emod * (1 - nu) / ((1 + nu) * (1 - 2 * nu))
         self._factor2 = emod * nu / ((1 + nu) * (1 - 2 * nu))
-        self.G = emod / (2 * (1 + nu))                     # Shear modulus
+        self.G = emod / (2 * (1 + nu))
 
-    def get_constitutive_matrix(self) -> torch.Tensor:
+    def _get_constitutive_matrix(self) -> torch.Tensor:
         """
         Returns the constant elastic constitutive matrix (3x3).
 
@@ -81,38 +85,19 @@ class LinearElastic(MaterialBase):
         C11 = self._factor1
         C12 = self._factor2
         C33 = self.G
+        return torch.tensor([[C11, C12, 0.0],
+                             [C12, C11, 0.0],
+                             [0.0,  0.0, C33]], dtype=self.dtype, device=self.device)
 
-        C = torch.tensor([[C11, C12, 0.0],
-                          [C12, C11, 0.0],
-                          [0.0,  0.0, C33]], dtype=torch.float64)
+    def update_state(self, strain, state_old, isTangent=True):
+        C = self._get_constitutive_matrix()
+        stress = torch.einsum('ij,...j->...i', C, strain)
         
-        if self.is_vectorized:
-            if self.nelem is None or self.ngp2 is None:
-                raise ValueError("Vectorized mode enabled but nelem or ngp not set. Call vectorize(nelem, ngp) first.")
-            C = C.unsqueeze(0).unsqueeze(0).expand(self.nelem, self.ngp2, -1, -1)
-        return C
-
-    def compute_stress(self, strain: torch.Tensor) -> torch.Tensor:
-        """
-        Compute stress from total strain: σ = C ε.
-
-        Parameters
-        ----------
-        strain : torch.Tensor
-            Total strain in Voigt notation. Shape (3,) or (ngp, 3).
-
-        Returns
-        -------
-        torch.Tensor
-            Cauchy stress in Voigt notation. Same shape as input.
-        """
-        C = self.get_constitutive_matrix().to(strain.device)
-        C = C.to(strain.dtype)
-        return torch.einsum('...ij,...j->...i', C, strain)
-
-    def compute_pk2_stress(self, gl_strain: torch.Tensor) -> torch.Tensor:
-        """Compute 2nd Piola-Kirchhoff stress from Green-Lagrange strain."""
-        return self.compute_stress(gl_strain)
+        ddsdde = None
+        if isTangent:
+            ddsdde = C.view(1, 1, 3, 3).expand(strain.shape[0], strain.shape[1], 3, 3)
+        
+        return stress, state_old, ddsdde
 
 
 class LinearElasticPlaneStress(MaterialBase):
@@ -122,7 +107,7 @@ class LinearElasticPlaneStress(MaterialBase):
     Uses Voigt notation: strain/stress vector = [ε_xx, ε_yy, 2ε_xy].
     """
     def __init__(self, emod: float, nu: float):
-        super().__init__()
+        super().__init__(n_state=0)
         """
         Parameters
         ----------
@@ -141,49 +126,20 @@ class LinearElasticPlaneStress(MaterialBase):
 
         self._factor1 = emod / (1 - nu**2)
 
-    def get_constitutive_matrix(self) -> torch.Tensor:
-        """
-        Returns the constant elastic constitutive matrix (3x3) for plane stress.
-
-        Returns
-        -------
-        torch.Tensor
-            Elastic stiffness matrix in Voigt notation.
-        """
+    def _get_constitutive_matrix(self) -> torch.Tensor:
         C11 = self._factor1
         C12 = self._factor1 * self.nu
         C33 = self._factor1 * (1 - self.nu) / 2
+        return torch.tensor([[C11, C12, 0.0],
+                             [C12, C11, 0.0],
+                             [0.0,  0.0, C33]], device=self.device, dtype=self.dtype)
 
-        C = torch.tensor([[C11, C12, 0.0],
-                          [C12, C11, 0.0],
-                          [0.0,  0.0, C33]], dtype=torch.float64)
+    def update_state(self, strain, state_old, isTangent=True):
+        C = self._get_constitutive_matrix()
+        stress = torch.einsum('ij,...j->...i', C, strain)
         
-        if self.is_vectorized:
-            if self.nelem is None or self.ngp2 is None:
-                raise ValueError("Vectorized mode enabled but nelem or ngp not set. Call vectorize(nelem, ngp) first.")
-            C = C.unsqueeze(0).unsqueeze(0).expand(self.nelem, self.ngp2, -1, -1)
+        ddsdde = None
+        if isTangent:
+            ddsdde = C.view(1, 1, 3, 3).expand(strain.shape[0], strain.shape[1], 3, 3)
         
-        return C
-
-    def compute_stress(self, strain: torch.Tensor) -> torch.Tensor:
-        """
-        Compute stress from total strain: σ = C ε.
-
-        Parameters
-        ----------
-        strain : torch.Tensor
-            Total strain in Voigt notation. Shape (3,) or (ngp, 3).
-
-        Returns
-        -------
-        torch.Tensor
-            Cauchy stress in Voigt notation. Same shape as input.
-        """
-        
-        C = self.get_constitutive_matrix().to(strain.device)
-        C = C.to(strain.dtype)
-        return torch.einsum('...ij,...j->...i', C, strain)
-    
-    def compute_pk2_stress(self, gl_strain: torch.Tensor) -> torch.Tensor:
-        """Second Piola-Kirchhoff stress"""
-        return self.compute_stress(gl_strain)
+        return stress, state_old, ddsdde
