@@ -22,6 +22,7 @@ class BaseSolver:
                         nodal_loads: NodalLoads  = None,
                         mpcs: MultiPointConstraints = None,
                         formulation: str = 'infinitesimal',
+                        device: torch.device = None,
                         verbose: bool = False):
         """
         Parameters (mandatory)
@@ -69,7 +70,10 @@ class BaseSolver:
 
         self.verbose = verbose
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if device is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = device
         self.dtype = None
         self._set_dtype()
 
@@ -613,11 +617,12 @@ class NFEA(BaseSolver):
                         nodal_loads: NodalLoads  = None,
                         mpcs: MultiPointConstraints = None,
                         formulation: str = 'infinitesimal',
+                        device: torch.device = None,
                         verbose: bool = False):
         
         super().__init__(mesh, bcs, matfld, thickness, 
                          body_loads, edge_loads, line_loads, nodal_loads, mpcs,
-                         formulation, verbose)
+                         formulation, device, verbose)
     
         if 'quad' in mesh.elements.keys():
             self.all_i_flat = torch.cat([batch.dofs[:, :, None].expand(-1, -1, batch.ndof_local).reshape(-1) 
@@ -833,6 +838,7 @@ class FEINN(BaseSolver):
                  nodal_loads: NodalLoads = None,
                  mpcs: MultiPointConstraints = None,
                  formulation: str = 'infinitesimal',
+                 device: torch.device = None,
                  verbose: bool = False,
                  nnet: nn.Module = None,
                  nnet_init: str = None,
@@ -843,7 +849,7 @@ class FEINN(BaseSolver):
 
         super().__init__(mesh, bcs, matfld, thickness, 
                          body_loads, edge_loads, line_loads, nodal_loads, mpcs,
-                         formulation, verbose)
+                         formulation, device, verbose)
         
         self.isData = isData
         self.bc_weight = bc_weight
