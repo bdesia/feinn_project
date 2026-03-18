@@ -55,6 +55,39 @@ Follow this steps:
     ```
 1. Now, you're ready to run the notebooks and make your own simulations.
 
+## Code implementation
+
+- [src/batch_elements.py](src/batch_elements.py): batched-version of finite elements library.
+
+- [src/conditions.py](src/conditions.py): Boundary conditions and External loads classes. 
+
+- [src/data_generator.py](src/data_generator.py):  Classes for strain paths generation for training subrogate constitutive models.
+
+- [src/elements.py](src/elements.py): single-version of finite elements library.
+
+- [src/evaluator.py](src/evaluator.py): Classes for testing, evaluate and make comparisons betweens models.
+
+- [src/materials.py](src/materials.py): Classes for materials constitutive models.
+
+- [src/rve_analyzer.py](src/rve_analyzer.py): Classes for handle FNO subrrogate constitutive model. From data pre-proccesing until evaluation. It contains:
+    - `RVEDataset` class: dataloader for master file raw date.
+    - `DualEncoderFNO` class: Our FNO generic model.
+    - `RVEInferencer` class: for making inferences with the trained model.
+    - `RVEVisualizer` class: for plotting and compare results.
+
+- [src/solver.py](src/solver.py): Solver classes. It contains:
+    - `NFEA` class: Non-linear finite element code
+    - `FEINN` class: Finite Element-integrated Neural Network
+
+- [src/trainer.py](src/trainer.py): It contains some useful classes for training FEINN models like self-adative loss weighting.
+
+- [src/utils.py](src/utils.py): It contains some useful classes for finite element analysis like shape functions and gauss points.
+
+
+## Component Interaction Flow
+
+TODO
+
 ## Roadmap
 
 ### 1st Part: Finite Element integrated Neural Network for Solid Mechanics
