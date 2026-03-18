@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from sklearn.metrics import r2_score, mean_absolute_error
 import matplotlib.pyplot as plt
 from scipy.interpolate import griddata
@@ -19,9 +20,9 @@ class SolutionComparator:
         Initialize with mesh and solutions. Validates sizes.
         """
         self.mesh = mesh
-        self.y_true = np.array(y_true)
-        self.y_pred = np.array(y_pred)
-        
+        self.y_true = _to_numpy(y_pred)
+        self.y_pred = _to_numpy(y_true)
+
         # Validate sizes
         if self.y_true.shape != self.y_pred.shape:
             raise ValueError("Reference and comparison solutions must have the same size.")
@@ -36,6 +37,11 @@ class SolutionComparator:
                                          100 * np.abs((self.y_pred - self.y_true) / self.y_true), 
                                          0)  # Avoid division by zero
         }
+    
+    def _to_numpy(data):
+        if torch.is_tensor(data):
+            return data.detach().cpu().numpy()
+        return np.array(data)
     
     def compute_r2(self):
         """Compute R² score."""
