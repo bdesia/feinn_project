@@ -251,6 +251,8 @@ class DualEncoderFNO(nn.Module):
         If True, add 2D positional grid embeddings to the input of the lifting block. Default: True
     non_linearity : nn.Module, optional
         Non-Linear activation function module to use. Default: nn.GELU()
+    channel_mlp_dropout : float, optional
+        Dropout parameter for self.channel_mlp in FNOBlock, by default 0
     film_per_layer : bool, optional
         If True, compute separate FiLM parameters for each FNO layer (more expressive, more parameters). 
         Default: False (one FiLM conditioning previous to the first FNO block).
@@ -258,7 +260,9 @@ class DualEncoderFNO(nn.Module):
         Number of layers in the FiLM MLP. Default: 2
     film_mlp_neurons : int, optional
         Number of neurons in each hidden layer of the FiLM MLP. Only apply if film_mlp_layers > 1.
-        Default: 128 
+        Default: 128
+    film_mlp_dropout : float, optional
+        Dropout parameter for FiLM MLP, by default 0      
     """
 
     def __init__(self,
@@ -272,9 +276,11 @@ class DualEncoderFNO(nn.Module):
                  projection_channel_ratio: int = 2,
                  use_positional_grid: bool = True,
                  non_linearity: nn.Module = nn.GELU(),
+                 channel_mlp_dropout: float = 0,
                  film_per_layer: bool = False,
                  film_mlp_layers: int = 2,
                  film_mlp_neurons: int = 128,
+                 film_mlp_dropout: float = 0,
                  **fno_blocks_kwargs
                  ):
         super().__init__()
@@ -293,6 +299,9 @@ class DualEncoderFNO(nn.Module):
         self.film_mlp_layers = film_mlp_layers
         self.film_mlp_neurons = film_mlp_neurons
         
+        self.film_mlp_dropout = film_mlp_dropout
+        self.dropout = nn.Dropout(p=film_mlp_dropout) if film_mlp_dropout > 0 else nn.Identity()
+
         # init lifting and projection channels using ratios w.r.t width
         self.lifting_channel_ratio = lifting_channel_ratio
         self.lifting_channels = int(lifting_channel_ratio * hidden_channels)
@@ -328,6 +337,7 @@ class DualEncoderFNO(nn.Module):
         for _ in range(max(1, film_mlp_layers) - 1):
             film_layers.append(nn.Linear(in_dim, film_mlp_neurons))
             film_layers.append(non_linearity)
+            film_layers.append(self.dropout)
             in_dim = film_mlp_neurons
         # Output layer
         film_layers.append(nn.Linear(in_dim, film_out_features * 2))
@@ -341,6 +351,7 @@ class DualEncoderFNO(nn.Module):
             n_modes=(self.n_modes,) * self.n_dim,
             non_linearity=non_linearity,
             n_layers=n_layers,
+            channel_mlp_dropout=channel_mlp_dropout,
             **fno_blocks_kwargs
         )
 
@@ -421,11 +432,13 @@ class DualEncoderFNO(nn.Module):
             "projection_channel_ratio": self.projection_channel_ratio,
             "use_positional_grid": self.use_positional_grid,
             "non_linearity": self.non_linearity,
+            "channel_mlp_dropout": self.channel_mlp_dropout,
             "film_per_layer": self.film_per_layer,
             "film_mlp_layers": self.film_mlp_layers,
             "film_mlp_neurons": self.film_mlp_neurons,
+            "film_mlp_dropout": self.film_mlp_dropout,
         }
-        
+
         torch.save(config, path)
         print(f"Saved configuration at {path}")
         
