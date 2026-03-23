@@ -34,18 +34,18 @@ import h5py
 class RVEDataset(Dataset):
     """
     Optimized Dataset for Dual-Encoder FNO Training on RVE Data.
-    - Added `in_memory` flag to bypass HDF5 disk I/O during training.
-    - Vectorized normalization and permutation in RAM for massive speedups.
-    - Maintains Lazy loading fallback for low-RAM environments.
+    - Full pre-scaling of the entire dataset when augment=False + in_memory=True
+    - Augmentation ALWAYS on raw physical data
+    - Normalization AFTER augmentation
+    - Lazy loading fully compatible
     """
 
     def __init__(self, h5_path: str | Path, 
                  split: str = 'train',
-                 fraction: float = 1.0,         # for sub-sampling
+                 fraction: float = 1.0,
                  normalize: bool = True, 
                  in_memory: bool = False,
-                 augment: bool = False,
-                 ):
+                 augment: bool = False):
         
         self.h5_path = Path(h5_path)
         self.split = split
@@ -53,18 +53,16 @@ class RVEDataset(Dataset):
         self.normalize = normalize
         self.in_memory = in_memory
         self.augment = augment
-        self.archive = None  # Initialized in __getitem__ to avoid pickling errors
+        self.archive = None
 
         self._check_split()
 
-        # Initial read for metadata and precomputed statistics
         with h5py.File(self.h5_path, 'r') as f:
             N_total = f[split]['x_local'].shape[0]
             stats = f['stats']
 
             if self.fraction < 1.0:
                 self.N = int(N_total * self.fraction)
-                # h5py requires that boolean or list indices be strictly ordered for fast access
                 self.indices = np.sort(np.random.choice(N_total, self.N, replace=False))
                 indexs = self.indices
             else:
@@ -72,92 +70,122 @@ class RVEDataset(Dataset):
                 self.indices = None
                 indexs = slice(None)
 
-            # Normalizers 
+            # Normalizers — x_global strictly 3 components
             self.x_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_x_local'][:]).float(),
-                std=torch.from_numpy(stats['std_x_local'][:]).float()
+                mean=torch.from_numpy(stats['mean_x_local'][:]).float().view(-1, 1, 1),
+                std=torch.from_numpy(stats['std_x_local'][:]).float().view(-1, 1, 1)
             )
             self.global_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_x_global'][:]).float(),
-                std=torch.from_numpy(stats['std_x_global'][:]).float()
+                mean=torch.from_numpy(stats['mean_x_global'][:3]).float().view(-1, 1),
+                std=torch.from_numpy(stats['std_x_global'][:3]).float().view(-1, 1)
             )
             self.y_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_y_local'][:]).float(),
-                std=torch.from_numpy(stats['std_y_local'][:]).float()
+                mean=torch.from_numpy(stats['mean_y_local'][:]).float().view(-1, 1, 1),
+                std=torch.from_numpy(stats['std_y_local'][:]).float().view(-1, 1, 1)
             )
 
-            # --- Load to RAM ---
+            # --- Load to RAM + full pre-scaling ---
             if self.in_memory:
-                print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM. This may take a moment...")
-                # Slicing [:] reads the entire chunk sequentially (extremely fast compared to random access)
-                self.x_local_data = torch.from_numpy(f[split]['x_local'][indexs]).float()
-                self.x_global_data = torch.from_numpy(f[split]['x_global'][indexs]).float()
-                self.y_local_data = torch.from_numpy(f[split]['y_local'][indexs]).float()
+                print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM...")
+                
+                x_raw = torch.from_numpy(f[split]['x_local'][indexs]).float()
+                g_raw = torch.from_numpy(f[split]['x_global'][indexs]).float()
+                y_raw = torch.from_numpy(f[split]['y_local'][indexs]).float()
+
+                self.x_local_data  = x_raw.permute(0, 3, 1, 2).contiguous()
+                self.y_local_data  = y_raw.permute(0, 3, 1, 2).contiguous()
+                self.x_global_data = g_raw[:, :3].contiguous()
 
                 if self.normalize and not self.augment:
-                    # Vectorized operations: Transform the entire dataset at once (C++ backend)
-                    self.x_local_data = self.x_normalizer.transform(self.x_local_data)
+                    self.x_local_data  = self.x_normalizer.transform(self.x_local_data)
                     self.x_global_data = self.global_normalizer.transform(self.x_global_data)
-                    self.y_local_data = self.y_normalizer.transform(self.y_local_data)
+                    self.y_local_data  = self.y_normalizer.transform(self.y_local_data)
 
-                # Vectorized permutation: (N, H, W, C) -> (N, C, H, W) 
-                # Done once per epoch instead of n times.
-                self.x_local_data = self.x_local_data.permute(0, 3, 1, 2).contiguous()
-                self.y_local_data = self.y_local_data.permute(0, 3, 1, 2).contiguous()
-                
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                    
-    def __len__(self):
-        return self.N
 
     def __getitem__(self, idx):
-        # --- FAST PATH ---
         if self.in_memory:
             if not self.augment:
-                # Ultra-fast retrieval: Data is already pre-processed and ready
-                return self.x_local_data[idx], self.x_global_data[idx, :3], self.y_local_data[idx]
-            else:
-                # Must clone to avoid corrupting the cached dataset with in-place operations
-                x_local = self.x_local_data[idx].clone()
-                x_global = self.x_global_data[idx, :3].clone()
-                y_local = self.y_local_data[idx].clone()
+                # Ultra-fast path
+                return self.x_local_data[idx], self.x_global_data[idx], self.y_local_data[idx]
 
-                # Apply augmentation before normalization (preserves physical consistency)
-                x_local, x_global, y_local = self._apply_augmentation(x_local, x_global, y_local)
-                
-                if self.normalize:
-                    x_local = self.x_normalizer.transform(x_local)
-                    x_global = self.global_normalizer.transform(x_global)
-                    y_local = self.y_normalizer.transform(y_local)
-                
-                return x_local, x_global, y_local
+            # Augment + normalize on-the-fly
+            x_local  = self.x_local_data[idx].clone()
+            x_global = self.x_global_data[idx].clone()
+            y_local  = self.y_local_data[idx].clone()
+
+            x_local, x_global, y_local = self._apply_augmentation(x_local, x_global, y_local)
+            return self._normalize(x_local, x_global, y_local)
+
+        # === LAZY LOADING FALLBACK  ===
         else:
-            # --- LAZY LOADING FALLBACK ---
             if self.archive is None:
                 self.archive = h5py.File(self.h5_path, 'r', swmr=True)
 
             data = self.archive[self.split]
-
-            # Correct index mapping when using fraction < 1.0 (subsampling)
             real_idx = self.indices[idx] if self.indices is not None else idx
 
-            x_local = torch.from_numpy(data['x_local'][real_idx]).float()
-            x_global = torch.from_numpy(data['x_global'][real_idx]).float()
+            x_local  = torch.from_numpy(data['x_local'][real_idx]).float()
+            x_global = torch.from_numpy(data['x_global'][real_idx]).float()[:3]
             y_local  = torch.from_numpy(data['y_local'][real_idx]).float()
 
             x_local = x_local.permute(2, 0, 1).contiguous()
             y_local = y_local.permute(2, 0, 1).contiguous()
-            
+
             if self.augment:
                 x_local, x_global, y_local = self._apply_augmentation(x_local, x_global, y_local)
 
-            if self.normalize:
-                x_local = self.x_normalizer.transform(x_local)
-                x_global = self.global_normalizer.transform(x_global)
-                y_local = self.y_normalizer.transform(y_local)
+            return self._normalize(x_local, x_global, y_local)
 
-            return x_local, x_global[:3], y_local
+    # ====================== PRIVATE HELPERS ======================
+
+    def _normalize(self, x_local, x_global, y_local):
+        """Apply normalization consistently (same in ALL paths)."""
+        if self.normalize:
+            x_local = self.x_normalizer.transform(x_local)
+            x_global = self.global_normalizer.transform(x_global)
+            y_local  = self.y_normalizer.transform(y_local)
+        return x_local, x_global, y_local
+
+    def _apply_augmentation(self, x_local: torch.Tensor, x_global: torch.Tensor, y_local: torch.Tensor):
+        """
+        Stochastic geometric transformations preserving 2D solid mechanics laws.
+        x_global is ALWAYS exactly 3 components: [exx, eyy, gxy]
+        """
+        do_hflip = torch.rand(1).item() > 0.5
+        do_vflip = torch.rand(1).item() > 0.5
+        k = torch.randint(0, 4, (1,)).item()
+
+        # Horizontal Flip
+        if do_hflip:
+            x_local = torch.flip(x_local, dims=[-1])
+            y_local = torch.flip(y_local, dims=[-1])
+            x_global[2] *= -1.0
+            y_local[2] *= -1.0
+
+        # Vertical Flip
+        if do_vflip:
+            x_local = torch.flip(x_local, dims=[-2])
+            y_local = torch.flip(y_local, dims=[-2])
+            x_global[2] *= -1.0
+            y_local[2] *= -1.0
+
+        # Orthogonal Rotations
+        if k > 0:
+            x_local = torch.rot90(x_local, k=k, dims=[-2, -1])
+            y_local = torch.rot90(y_local, k=k, dims=[-2, -1])
+            
+            if k == 1 or k == 3:  # 90° or 270°
+                temp = x_global[0].clone()
+                x_global[0] = x_global[1]
+                x_global[1] = temp
+                x_global[2] *= -1.0
+                y_local = y_local[[1, 0, 2]]
+
+        return x_local, x_global, y_local
+
+    # ====================== STANDARD METHODS ======================
 
     def get_normalizers(self):
         return self.x_normalizer, self.global_normalizer, self.y_normalizer
@@ -179,50 +207,7 @@ class RVEDataset(Dataset):
         with h5py.File(self.h5_path, 'r') as f:
             if self.split not in f:
                 raise ValueError(f"Split '{self.split}' not found. Available splits: {list(f.keys())}")
-
-    def _apply_augmentation(self, x_local: torch.Tensor, x_global: torch.Tensor, y_local: torch.Tensor):
-        """
-        Applies stochastic geometric transformations preserving 2D solid mechanics laws.
-        Assumes tensor channels are strictly ordered as:
-        - x_global: [exx, eyy, gxy] (macroscopic engineering strain)
-        - y_local:  [sxx, syy, sxy] (microscopic stress fields, shape: C, H, W)
-        """
-        # Horizontal Flip (Mirroring across Y-axis)
-        if torch.rand(1) > 0.5:
-            x_local = torch.flip(x_local, dims=[-1])
-            y_local = torch.flip(y_local, dims=[-1])
-            # Shear strain and stress invert sign
-            x_global[2] *= -1.0  
-            y_local[2, :, :] *= -1.0
-
-        # Vertical Flip (Mirroring across X-axis)
-        if torch.rand(1) > 0.5:
-            x_local = torch.flip(x_local, dims=[-2])
-            y_local = torch.flip(y_local, dims=[-2])
-            # Shear strain and stress invert sign
-            x_global[2] *= -1.0  
-            y_local[2, :, :] *= -1.0
-
-        # Orthogonal Rotations (0°, 90°, 180°, 270° counter-clockwise)
-        k = torch.randint(0, 4, (1,)).item()
-        if k > 0:
-            x_local = torch.rot90(x_local, k=k, dims=[-2, -1])
-            y_local = torch.rot90(y_local, k=k, dims=[-2, -1])
             
-            if k == 1 or k == 3: # 90° or 270° rotation
-                # Swap Normal X and Normal Y channels
-                x_global = x_global[[1, 0, 2]]
-                y_local = y_local[[1, 0, 2], :, :]
-                
-                # Shear components invert sign under 90° and 270° rotations
-                x_global[2] *= -1.0
-                y_local[2, :, :] *= -1.0
-            
-            # Note: For k == 2 (180°), it is equivalent to both horizontal and vertical flips.
-            # Normal components remain in place, and shear sign flips twice (-1 * -1 = 1), remaining unchanged.
-
-        return x_local, x_global, y_local
-
 class DualEncoderFNO(nn.Module):
     """
     Dual-Encoder Fourier Neural Operator for RVE Analysis with FiLM Conditioning
