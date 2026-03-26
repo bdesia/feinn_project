@@ -10,6 +10,7 @@ from typing import Optional, Dict, Tuple, Callable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from neuralop.data.transforms.normalizers import UnitGaussianNormalizer
@@ -17,6 +18,8 @@ from neuralop.layers.fno_block import FNOBlocks
 from neuralop.layers.channel_mlp import ChannelMLP
 from neuralop.layers.embeddings import SinusoidalEmbedding, GridEmbedding2D
 from neuralop.losses import LpLoss
+from neuralop.losses.differentiation import FiniteDiff
+
 
 # Only import wandb and use if installed
 wandb_available = False
@@ -34,29 +37,27 @@ import h5py
 class RVEDataset(Dataset):
     """
     Optimized Dataset for Dual-Encoder FNO Training on RVE Data.
-    - Full pre-scaling of the entire dataset when augment=False + in_memory=True
-    - Augmentation ALWAYS on raw physical data
-    - Normalization AFTER augmentation
-    - Lazy loading fully compatible
+    - Added `in_memory` flag to bypass HDF5 disk I/O during training.
+    - Vectorized normalization and permutation in RAM for massive speedups.
+    - Maintains Lazy loading fallback for low-RAM environments.
     """
 
     def __init__(self, h5_path: str | Path, 
                  split: str = 'train',
-                 fraction: float = 1.0,
+                 fraction: float = 1.0,         # for sub-sampling
                  normalize: bool = True, 
-                 in_memory: bool = False,
-                 augment: bool = False):
+                 in_memory: bool = False,):
         
         self.h5_path = Path(h5_path)
         self.split = split
         self.fraction = fraction
         self.normalize = normalize
         self.in_memory = in_memory
-        self.augment = augment
-        self.archive = None
+        self.archive = None  # Initialized in __getitem__ to avoid pickling errors
 
         self._check_split()
 
+        # Initial read for metadata and precomputed statistics
         with h5py.File(self.h5_path, 'r') as f:
             N_total = f[split]['x_local'].shape[0]
             stats = f['stats']
@@ -69,123 +70,73 @@ class RVEDataset(Dataset):
                 self.N = N_total
                 self.indices = None
                 indexs = slice(None)
-
-            # Normalizers — x_global strictly 3 components
+                
+            # Normalizers 
             self.x_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_x_local'][:]).float().view(-1, 1, 1),
-                std=torch.from_numpy(stats['std_x_local'][:]).float().view(-1, 1, 1)
+                mean=torch.from_numpy(stats['mean_x_local'][:]).float(),
+                std=torch.from_numpy(stats['std_x_local'][:]).float()
             )
             self.global_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_x_global'][:3]).float().view(-1, 1),
-                std=torch.from_numpy(stats['std_x_global'][:3]).float().view(-1, 1)
+                mean=torch.from_numpy(stats['mean_x_global'][:]).float(),
+                std=torch.from_numpy(stats['std_x_global'][:]).float()
             )
             self.y_normalizer = UnitGaussianNormalizer(
-                mean=torch.from_numpy(stats['mean_y_local'][:]).float().view(-1, 1, 1),
-                std=torch.from_numpy(stats['std_y_local'][:]).float().view(-1, 1, 1)
+                mean=torch.from_numpy(stats['mean_y_local'][:]).float(),
+                std=torch.from_numpy(stats['std_y_local'][:]).float()
             )
 
-            # --- Load to RAM + full pre-scaling ---
+            # --- Load to RAM ---
             if self.in_memory:
-                print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM...")
-                
-                x_raw = torch.from_numpy(f[split]['x_local'][indexs]).float()
-                g_raw = torch.from_numpy(f[split]['x_global'][indexs]).float()
-                y_raw = torch.from_numpy(f[split]['y_local'][indexs]).float()
+                print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM. This may take a moment...")
+                # Slicing [:] reads the entire chunk sequentially (extremely fast compared to random access)
+                self.x_local_data = torch.from_numpy(f[split]['x_local'][indexs]).float()
+                self.x_global_data = torch.from_numpy(f[split]['x_global'][indexs]).float()
+                self.y_local_data = torch.from_numpy(f[split]['y_local'][indexs]).float()
 
-                self.x_local_data  = x_raw.permute(0, 3, 1, 2).contiguous()
-                self.y_local_data  = y_raw.permute(0, 3, 1, 2).contiguous()
-                self.x_global_data = g_raw[:, :3].contiguous()
+                # Vectorized permutation: (N, H, W, C) -> (N, C, H, W) 
+                # Done once per epoch instead of n times.
+                self.x_local_data = self.x_local_data.permute(0, 3, 1, 2).contiguous()
+                self.y_local_data = self.y_local_data.permute(0, 3, 1, 2).contiguous()
 
-                if self.normalize and not self.augment:
-                    self.x_local_data  = self.x_normalizer.transform(self.x_local_data)
+                if self.normalize:
+                    # Vectorized operations: Transform the entire dataset at once (C++ backend)
+                    self.x_local_data = self.x_normalizer.transform(self.x_local_data)
                     self.x_global_data = self.global_normalizer.transform(self.x_global_data)
-                    self.y_local_data  = self.y_normalizer.transform(self.y_local_data)
-
+                    self.y_local_data = self.y_normalizer.transform(self.y_local_data)
+                
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    
+    def __len__(self):
+        return self.N
 
     def __getitem__(self, idx):
+        # --- FAST PATH ---
         if self.in_memory:
-            if not self.augment:
-                # Ultra-fast path
-                return self.x_local_data[idx], self.x_global_data[idx], self.y_local_data[idx]
+            # Data is already parsed, normalized, permuted, and sitting in CPU RAM.
+            # This takes microseconds.
+            return self.x_local_data[idx], self.x_global_data[idx, :3], self.y_local_data[idx]
 
-            # Augment + normalize on-the-fly
-            x_local  = self.x_local_data[idx].clone()
-            x_global = self.x_global_data[idx].clone()
-            y_local  = self.y_local_data[idx].clone()
+        # --- LAZY LOADING FALLBACK ---
+        if self.archive is None:
+            self.archive = h5py.File(self.h5_path, 'r', swmr=True)
 
-            x_local, x_global, y_local = self._apply_augmentation(x_local, x_global, y_local)
-            return self._normalize(x_local, x_global, y_local)
+        data = self.archive[self.split]
+        real_idx = self.indices[idx] if self.indices is not None else idx
 
-        # === LAZY LOADING FALLBACK  ===
-        else:
-            if self.archive is None:
-                self.archive = h5py.File(self.h5_path, 'r', swmr=True)
+        x_local  = torch.from_numpy(data['x_local'][real_idx]).float()
+        x_global = torch.from_numpy(data['x_global'][real_idx]).float()[:3]
+        y_local  = torch.from_numpy(data['y_local'][real_idx]).float()
 
-            data = self.archive[self.split]
-            real_idx = self.indices[idx] if self.indices is not None else idx
-
-            x_local  = torch.from_numpy(data['x_local'][real_idx]).float()
-            x_global = torch.from_numpy(data['x_global'][real_idx]).float()[:3]
-            y_local  = torch.from_numpy(data['y_local'][real_idx]).float()
-
-            x_local = x_local.permute(2, 0, 1).contiguous()
-            y_local = y_local.permute(2, 0, 1).contiguous()
-
-            if self.augment:
-                x_local, x_global, y_local = self._apply_augmentation(x_local, x_global, y_local)
-
-            return self._normalize(x_local, x_global, y_local)
-
-    # ====================== PRIVATE HELPERS ======================
-
-    def _normalize(self, x_local, x_global, y_local):
-        """Apply normalization consistently (same in ALL paths)."""
+        x_local = x_local.permute(2, 0, 1).contiguous()
+        y_local = y_local.permute(2, 0, 1).contiguous()
+        
         if self.normalize:
             x_local = self.x_normalizer.transform(x_local)
             x_global = self.global_normalizer.transform(x_global)
-            y_local  = self.y_normalizer.transform(y_local)
-        return x_local, x_global, y_local
+            y_local = self.y_normalizer.transform(y_local)
 
-    def _apply_augmentation(self, x_local: torch.Tensor, x_global: torch.Tensor, y_local: torch.Tensor):
-        """
-        Stochastic geometric transformations preserving 2D solid mechanics laws.
-        x_global is ALWAYS exactly 3 components: [exx, eyy, gxy]
-        """
-        do_hflip = torch.rand(1).item() > 0.5
-        do_vflip = torch.rand(1).item() > 0.5
-        k = torch.randint(0, 4, (1,)).item()
-
-        # Horizontal Flip
-        if do_hflip:
-            x_local = torch.flip(x_local, dims=[-1])
-            y_local = torch.flip(y_local, dims=[-1])
-            x_global[2] *= -1.0
-            y_local[2] *= -1.0
-
-        # Vertical Flip
-        if do_vflip:
-            x_local = torch.flip(x_local, dims=[-2])
-            y_local = torch.flip(y_local, dims=[-2])
-            x_global[2] *= -1.0
-            y_local[2] *= -1.0
-
-        # Orthogonal Rotations
-        if k > 0:
-            x_local = torch.rot90(x_local, k=k, dims=[-2, -1])
-            y_local = torch.rot90(y_local, k=k, dims=[-2, -1])
-            
-            if k == 1 or k == 3:  # 90° or 270°
-                temp = x_global[0].clone()
-                x_global[0] = x_global[1]
-                x_global[1] = temp
-                x_global[2] *= -1.0
-                y_local = y_local[[1, 0, 2]]
-
-        return x_local, x_global, y_local
-
-    # ====================== STANDARD METHODS ======================
+        return x_local, x_global[:3], y_local
 
     def get_normalizers(self):
         return self.x_normalizer, self.global_normalizer, self.y_normalizer
@@ -207,7 +158,8 @@ class RVEDataset(Dataset):
         with h5py.File(self.h5_path, 'r') as f:
             if self.split not in f:
                 raise ValueError(f"Split '{self.split}' not found. Available splits: {list(f.keys())}")
-            
+
+
 class DualEncoderFNO(nn.Module):
     """
     Dual-Encoder Fourier Neural Operator for RVE Analysis with FiLM Conditioning
@@ -295,6 +247,7 @@ class DualEncoderFNO(nn.Module):
         self.n_layers = n_layers
         self.use_positional_grid = use_positional_grid
         self.non_linearity = non_linearity
+        self.channel_mlp_dropout = channel_mlp_dropout
         self.film_per_layer = film_per_layer
         self.film_mlp_layers = film_mlp_layers
         self.film_mlp_neurons = film_mlp_neurons
@@ -998,3 +951,77 @@ class RVEVisualizer:
             title = f'FNO predictions - Channel {channel}'
         fig.suptitle(title, y=1.1)
         plt.show()
+
+class EquilibriumLoss(object):
+    """
+    Enforces linear momentum balance (equilibrium) for RVE (strong form):
+        div(S) = 0
+
+    Expected input:
+        y_pred: (B, 3, H, W) with channels [Sxx, Syy, Sxy]
+    """
+
+    def __init__(self, loss=F.mse_loss, domain_length=1.0,
+                 periodic_in_x=True, periodic_in_y=True):
+        super().__init__()
+        self.loss = loss
+        self.domain_length = domain_length
+        if not isinstance(self.domain_length, (tuple, list)):
+            self.domain_length = [self.domain_length] * 2
+        self.periodic_in_x = periodic_in_x
+        self.periodic_in_y = periodic_in_y
+
+    def fdm(self, u):
+        """Finite-difference residual computation."""
+        if u.dim() == 5:
+            u = u.squeeze(1)
+        B, C, nx, ny = u.shape
+        if C != 3:
+            raise ValueError(f"Expected 3 channels (Sxx, Syy, Sxy), got {C}")
+
+        dx = self.domain_length[0] / nx
+        dy = self.domain_length[1] / ny
+
+        fd2d = FiniteDiff(dim=2, h=(dx, dy),
+                          periodic_in_x=self.periodic_in_x,
+                          periodic_in_y=self.periodic_in_y)
+
+        sxx, syy, sxy = u[:, 0], u[:, 1], u[:, 2]
+
+        res_x = fd2d.dx(sxx) + fd2d.dy(sxy)
+        res_y = fd2d.dx(sxy) + fd2d.dy(syy)
+
+        residual = torch.stack([res_x, res_y], dim=1)  # (B, 2, H, W)
+        target = torch.zeros_like(residual)
+
+        return self.loss(residual, target)
+
+    def __call__(self, y_pred: torch.Tensor, y: torch.Tensor = None):
+        return self.fdm(y_pred)
+
+class HomogenizedLoss(object):
+    """
+    Loss on the homogenized (volume-averaged) stress components.
+    
+    Input: pred, target → (B, 3, H, W)  [Sxx, Syy, Sxy]
+    """
+    def __init__(self, loss=F.mse_loss, relative: bool = True):
+        super().__init__()
+        self.loss = loss
+        self.relative = relative
+
+    def _homogenize(self, x: torch.Tensor) -> torch.Tensor:
+        """Spatial average → (B, 3)"""
+        return x.mean(dim=(-2, -1))
+
+    def __call__(self, y_pred: torch.Tensor, y: torch.Tensor, **kwargs):
+        pred_hom = self._homogenize(y_pred)   # (B, 3)
+        targ_hom = self._homogenize(y)        # (B, 3)
+
+        if self.relative:
+            # Relative L2 error averaged over batch
+            diff = pred_hom - targ_hom
+            rel_error = torch.norm(diff, p=2, dim=1) / (torch.norm(targ_hom, p=2, dim=1) + 1e-8)
+            return rel_error.mean() 
+        else:
+            return self.loss(pred_hom, targ_hom) 
