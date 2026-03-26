@@ -46,13 +46,16 @@ class RVEDataset(Dataset):
                  split: str = 'train',
                  fraction: float = 1.0,         # for sub-sampling
                  normalize: bool = True, 
-                 in_memory: bool = False,):
+                 in_memory: bool = False,
+                 augment: bool = False,
+                 ):
         
         self.h5_path = Path(h5_path)
         self.split = split
         self.fraction = fraction
         self.normalize = normalize
         self.in_memory = in_memory
+        self.augment = augment
         self.archive = None  # Initialized in __getitem__ to avoid pickling errors
 
         self._check_split()
@@ -85,6 +88,8 @@ class RVEDataset(Dataset):
                 std=torch.from_numpy(stats['std_y_local'][:]).float()
             )
 
+            self.pre_normalized = False
+            
             # --- Load to RAM ---
             if self.in_memory:
                 print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM. This may take a moment...")
@@ -98,11 +103,12 @@ class RVEDataset(Dataset):
                 self.x_local_data = self.x_local_data.permute(0, 3, 1, 2).contiguous()
                 self.y_local_data = self.y_local_data.permute(0, 3, 1, 2).contiguous()
 
-                if self.normalize:
+                if self.normalize and not self.augment:
                     # Vectorized operations: Transform the entire dataset at once (C++ backend)
                     self.x_local_data = self.x_normalizer.transform(self.x_local_data)
                     self.x_global_data = self.global_normalizer.transform(self.x_global_data)
                     self.y_local_data = self.y_normalizer.transform(self.y_local_data)
+                    self.pre_normalized = True
                 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -111,32 +117,81 @@ class RVEDataset(Dataset):
         return self.N
 
     def __getitem__(self, idx):
+        # FETCH DATA
         # --- FAST PATH ---
         if self.in_memory:
             # Data is already parsed, normalized, permuted, and sitting in CPU RAM.
-            # This takes microseconds.
-            return self.x_local_data[idx], self.x_global_data[idx, :3], self.y_local_data[idx]
+            x_loc = self.x_local_data[idx]
+            x_glob = self.x_global_data[idx]
+            y_loc = self.y_local_data[idx]
+        else:
+            # --- LAZY LOADING FALLBACK ---
+            if self.archive is None:
+                self.archive = h5py.File(self.h5_path, 'r', swmr=True)
 
-        # --- LAZY LOADING FALLBACK ---
-        if self.archive is None:
-            self.archive = h5py.File(self.h5_path, 'r', swmr=True)
+            data = self.archive[self.split]
+            real_idx = self.indices[idx] if self.indices is not None else idx
 
-        data = self.archive[self.split]
-        real_idx = self.indices[idx] if self.indices is not None else idx
+            x_loc  = torch.from_numpy(data['x_local'][real_idx]).float()
+            x_glob = torch.from_numpy(data['x_global'][real_idx]).float()
+            y_loc  = torch.from_numpy(data['y_local'][real_idx]).float()
 
-        x_local  = torch.from_numpy(data['x_local'][real_idx]).float()
-        x_global = torch.from_numpy(data['x_global'][real_idx]).float()[:3]
-        y_local  = torch.from_numpy(data['y_local'][real_idx]).float()
-
-        x_local = x_local.permute(2, 0, 1).contiguous()
-        y_local = y_local.permute(2, 0, 1).contiguous()
+            x_loc = x_loc.permute(2, 0, 1).contiguous()
+            y_loc = y_loc.permute(2, 0, 1).contiguous()
         
-        if self.normalize:
-            x_local = self.x_normalizer.transform(x_local)
-            x_global = self.global_normalizer.transform(x_global)
-            y_local = self.y_normalizer.transform(y_local)
+        # DATA AUGMENTATION
+        if self.augment:
+            x_loc, x_glob, y_loc = self._apply_augmentation(x_loc, x_glob, y_loc)
 
-        return x_local, x_global[:3], y_local
+        # ON-THE-FLY NORMALIZATION (if apply)
+        if self.normalize and not self.pre_normalized:
+            x_loc = self.x_normalizer.transform(x_loc)
+            x_glob = self.global_normalizer.transform(x_glob)
+            y_loc = self.y_normalizer.transform(y_loc)
+
+        return x_loc, x_glob[:3], y_loc
+
+    def _apply_augmentation(self, x_loc, x_glob, y_loc):
+        """
+        Apply consistent data transformation
+        """
+        # Clone tensors
+        x_loc = x_loc.clone()
+        x_glob = x_glob.clone()
+        y_loc = y_loc.clone()
+
+        # Horizontal Flip (Y-axis, dim=-1)
+        if torch.rand(1).item() < 0.5:
+            x_loc = torch.flip(x_loc, dims=[-1])
+            y_loc = torch.flip(y_loc, dims=[-1])
+            x_glob[2] *= -1.0   # Invert sign of shear components
+            y_loc[2] *= -1.0
+
+        # Vertical Flip (X-axis, dim=-2)
+        if torch.rand(1).item() < 0.5:
+            x_loc = torch.flip(x_loc, dims=[-2])
+            y_loc = torch.flip(y_loc, dims=[-2])
+            x_glob[2] *= -1.0   # Invert sign of shear components
+            y_loc[2] *= -1.0
+            
+        # Rotations (0, 90, 180, 270 grados)
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            x_loc = torch.rot90(x_loc, k=k, dims=[-2, -1])
+            y_loc = torch.rot90(y_loc, k=k, dims=[-2, -1])
+            
+            if k % 2 != 0:  # k=1 (90º) or k=3 (270º)
+                # Swapear normal components (xx <-> yy)
+                x_glob[:2] = x_glob[[1, 0]]
+                y_loc = y_loc[[1, 0, 2], ...]
+                
+                # Invert sign of shear components
+                x_glob[2] *= -1.0
+                y_loc[2] *= -1.0
+                
+            # elif k = 2 (180º) only x_local is rotated, x_global and y_local remains the same
+            
+        return x_loc, x_glob, y_loc
 
     def get_normalizers(self):
         return self.x_normalizer, self.global_normalizer, self.y_normalizer
