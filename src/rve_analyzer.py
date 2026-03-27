@@ -58,21 +58,24 @@ class RVEDataset(Dataset):
         self.augment = augment
         self.archive = None  # Initialized in __getitem__ to avoid pickling errors
 
-        self._check_split()
-
         # Initial read for metadata and precomputed statistics
         with h5py.File(self.h5_path, 'r') as f:
+            
+            # check split
+            if split not in f:
+                raise ValueError(f"Split '{split}' not found. Available splits: {list(f.keys())}")
+            
             N_total = f[split]['x_local'].shape[0]
             stats = f['stats']
 
             if self.fraction < 1.0:
                 self.N = int(N_total * self.fraction)
                 self.indices = np.sort(np.random.choice(N_total, self.N, replace=False))
-                indexs = self.indices
+                idx_slice = self.indices
             else:
                 self.N = N_total
                 self.indices = None
-                indexs = slice(None)
+                idx_slice = slice(None)
                 
             # Normalizers 
             self.x_normalizer = UnitGaussianNormalizer(
@@ -94,9 +97,9 @@ class RVEDataset(Dataset):
             if self.in_memory:
                 print(f"Loading {self.fraction*100:.0f}% of '{split}' split into RAM. This may take a moment...")
                 # Slicing [:] reads the entire chunk sequentially (extremely fast compared to random access)
-                self.x_local_data = torch.from_numpy(f[split]['x_local'][indexs]).float()
-                self.x_global_data = torch.from_numpy(f[split]['x_global'][indexs]).float()
-                self.y_local_data = torch.from_numpy(f[split]['y_local'][indexs]).float()
+                self.x_local_data = torch.from_numpy(f[split]['x_local'][idx_slice]).float()
+                self.x_global_data = torch.from_numpy(f[split]['x_global'][idx_slice]).float()
+                self.y_local_data = torch.from_numpy(f[split]['y_local'][idx_slice]).float()
 
                 # Vectorized permutation: (N, H, W, C) -> (N, C, H, W) 
                 # Done once per epoch instead of n times.
@@ -109,10 +112,7 @@ class RVEDataset(Dataset):
                     self.x_global_data = self.global_normalizer.transform(self.x_global_data)
                     self.y_local_data = self.y_normalizer.transform(self.y_local_data)
                     self.pre_normalized = True
-                
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    
+
     def __len__(self):
         return self.N
 
@@ -151,47 +151,84 @@ class RVEDataset(Dataset):
 
         return x_loc, x_glob[:3], y_loc
 
+    @staticmethod
+    def _horizontal_flip(x_loc, x_glob, y_loc):
+        x_loc = torch.flip(x_loc, dims=[-1])
+        y_loc = torch.flip(y_loc, dims=[-1])
+        x_glob[2] *= -1.0   # Invert sign of shear components
+        y_loc[2] *= -1.0
+        return x_loc, x_glob, y_loc
+    
+    @staticmethod
+    def _vertical_flip(x_loc, x_glob, y_loc):
+        x_loc = torch.flip(x_loc, dims=[-2])
+        y_loc = torch.flip(y_loc, dims=[-2])
+        x_glob[2] *= -1.0   # Invert sign of shear components
+        y_loc[2] *= -1.0
+        return x_loc, x_glob, y_loc
+    @staticmethod
+    def _rotate(x_loc, x_glob, y_loc, k):
+        x_loc = torch.rot90(x_loc, k=k, dims=[-2, -1])
+        y_loc = torch.rot90(y_loc, k=k, dims=[-2, -1])
+        
+        if k % 2 != 0:  # k=1 (90º) or k=3 (270º)
+            # Swapear normal components (xx <-> yy)
+            x_glob[:2] = x_glob[[1, 0]]
+            y_loc = y_loc[[1, 0, 2], ...]
+            
+            # Invert sign of shear components
+            x_glob[2] *= -1.0
+            y_loc[2] *= -1.0
+            
+        # elif k = 2 (180º) only x_local is rotated, x_global and y_local remains the same
+        return x_loc, x_glob, y_loc
+
+    @staticmethod
+    def _main_diagonal_reflection(x_loc, x_glob, y_loc):
+        x_loc = x_loc.transpose(-2, -1)
+        y_loc = y_loc.transpose(-2, -1)
+        
+        # Interchange normals (xx <-> yy). Shear remains with the same sign
+        x_glob[:2] = x_glob[[1, 0]]
+        y_loc = y_loc[[1, 0, 2], ...]
+        
+        return x_loc, x_glob, y_loc
+
+    @staticmethod
+    def _anti_diagonal_reflection(x_loc, x_glob, y_loc):
+        x_loc = torch.flip(x_loc.transpose(-2, -1), dims=[-2, -1])
+        y_loc = torch.flip(y_loc.transpose(-2, -1), dims=[-2, -1])
+        
+        # Interchange normals (xx <-> yy). Shear remains with the same sign
+        x_glob[:2] = x_glob[[1, 0]]
+        y_loc = y_loc[[1, 0, 2], ...]
+        
+        return x_loc, x_glob, y_loc
+
+    _augmentations = [
+        lambda x, g, y: (x, g, y),                                          # 0: Identity
+        lambda x, g, y: RVEDataset._horizontal_flip(x, g, y),               # 1: Horizontal Flip
+        lambda x, g, y: RVEDataset._vertical_flip(x, g, y),                 # 2: Vertical Flip
+        lambda x, g, y: RVEDataset._rotate(x, g, y, 1),                     # 3: Rotate 90°
+        lambda x, g, y: RVEDataset._rotate(x, g, y, 2),                     # 4: Rotate 180°
+        lambda x, g, y: RVEDataset._rotate(x, g, y, 3),                     # 5: Rotate 270°
+        lambda x, g, y: RVEDataset._main_diagonal_reflection(x, g, y),      # 6: Main Diagonal Reflection
+        lambda x, g, y: RVEDataset._anti_diagonal_reflection(x, g, y),      # 7: Anti-Diagonal Reflection
+    ]
+
     def _apply_augmentation(self, x_loc, x_glob, y_loc):
         """
-        Apply consistent data transformation
+        Apply consistent data transformation uniformly over the D4 group
         """
         # Clone tensors
         x_loc = x_loc.clone()
         x_glob = x_glob.clone()
         y_loc = y_loc.clone()
 
-        # Horizontal Flip (Y-axis, dim=-1)
-        if torch.rand(1).item() < 0.5:
-            x_loc = torch.flip(x_loc, dims=[-1])
-            y_loc = torch.flip(y_loc, dims=[-1])
-            x_glob[2] *= -1.0   # Invert sign of shear components
-            y_loc[2] *= -1.0
+        idx = torch.randint(0, 8, (1,)).item()
+        transform = self._augmentations[idx] 
 
-        # Vertical Flip (X-axis, dim=-2)
-        if torch.rand(1).item() < 0.5:
-            x_loc = torch.flip(x_loc, dims=[-2])
-            y_loc = torch.flip(y_loc, dims=[-2])
-            x_glob[2] *= -1.0   # Invert sign of shear components
-            y_loc[2] *= -1.0
-            
-        # Rotations (0, 90, 180, 270 grados)
-        k = torch.randint(0, 4, (1,)).item()
-        if k > 0:
-            x_loc = torch.rot90(x_loc, k=k, dims=[-2, -1])
-            y_loc = torch.rot90(y_loc, k=k, dims=[-2, -1])
-            
-            if k % 2 != 0:  # k=1 (90º) or k=3 (270º)
-                # Swapear normal components (xx <-> yy)
-                x_glob[:2] = x_glob[[1, 0]]
-                y_loc = y_loc[[1, 0, 2], ...]
-                
-                # Invert sign of shear components
-                x_glob[2] *= -1.0
-                y_loc[2] *= -1.0
-                
-            # elif k = 2 (180º) only x_local is rotated, x_global and y_local remains the same
-            
-        return x_loc, x_glob, y_loc
+        return transform(x_loc, x_glob, y_loc)
 
     def get_normalizers(self):
         return self.x_normalizer, self.global_normalizer, self.y_normalizer
@@ -208,12 +245,6 @@ class RVEDataset(Dataset):
     def __setstate__(self, state):
         self.__dict__.update(state)
         self.archive = None  
-
-    def _check_split(self):
-        with h5py.File(self.h5_path, 'r') as f:
-            if self.split not in f:
-                raise ValueError(f"Split '{self.split}' not found. Available splits: {list(f.keys())}")
-
 
 class DualEncoderFNO(nn.Module):
     """
