@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 from matplotlib import ticker
 from matplotlib.ticker import AutoMinorLocator
 from typing import Optional, Dict, Tuple, Callable
+from math import log2
+import time
 
 import torch
 import torch.nn as nn
@@ -287,6 +289,10 @@ class DualEncoderFNO(nn.Module):
         projection_channel_ratio * hidden_channels (e.g. default 2 * hidden_channels).
     use_positional_grid : bool, optional
         If True, add 2D positional grid embeddings to the input of the lifting block. Default: True
+    use_sinusoidal_emb : bool, optional
+        If True, add sinusoidal positional embedding of the coordinates to the input of the lifting block. Default: False
+    sin_emb_nfreq : int, optional
+        Number of frequencies for the sinusoidal embedding. Default: 2
     non_linearity : nn.Module, optional
         Non-Linear activation function module to use. Default: nn.GELU()
     channel_mlp_dropout : float, optional
@@ -313,6 +319,8 @@ class DualEncoderFNO(nn.Module):
                  lifting_channel_ratio: int = 2,
                  projection_channel_ratio: int = 2,
                  use_positional_grid: bool = True,
+                 use_sinusoidal_emb: bool = False,
+                 sin_emb_nfreq: int = 2,
                  non_linearity: nn.Module = nn.GELU(),
                  channel_mlp_dropout: float = 0,
                  film_per_layer: bool = False,
@@ -332,6 +340,8 @@ class DualEncoderFNO(nn.Module):
         self.hidden_channels = hidden_channels
         self.n_layers = n_layers
         self.use_positional_grid = use_positional_grid
+        self.use_sinusoidal_emb = use_sinusoidal_emb
+        self.sin_emb_nfreq = sin_emb_nfreq
         self.non_linearity = non_linearity
         self.channel_mlp_dropout = channel_mlp_dropout
         self.film_per_layer = film_per_layer
@@ -357,6 +367,15 @@ class DualEncoderFNO(nn.Module):
                 grid_boundaries=[[0., 1.], [0., 1.]]
             )
             in_channels += self.n_dim     # update number of channels if positional embeddings
+
+            if use_sinusoidal_emb:
+                self.sin_emb_maxfreq = 2 ** (self.sin_emb_nfreq - 1)
+                self.sinusoidal_embedding = SinusoidalEmbedding(
+                    in_channels=2,                              # for 2-d coordinates
+                    num_frequencies=self.sin_emb_nfreq,         # number of frequencies
+                    embedding_type="nerf"
+                )
+                in_channels += 2 * self.n_dim * self.sin_emb_nfreq
 
         self.lifting = ChannelMLP(
             in_channels = in_channels,
@@ -411,7 +430,7 @@ class DualEncoderFNO(nn.Module):
         """
         
         # Check that n_modes does not exceed Nyquist frequency for the input resolution
-        _, _, H, W = x_local.shape
+        B, _, H, W = x_local.shape
         max_modes = min(H, W) // 2
         
         if self.n_modes > max_modes:
@@ -420,10 +439,28 @@ class DualEncoderFNO(nn.Module):
                 f"for the input resolution {H}x{W}. "
                 f"n_modes must be <= {max_modes}."
             )
-        
+
+        if self.use_positional_grid and self.use_sinusoidal_emb and self.sin_emb_maxfreq > max_modes:
+            max_allowed_nfreq = int(log2(max_modes)) + 1
+            raise ValueError(
+                f"Maximum sinusoidal embedding frequency (sin_emb_maxfreq={self.sin_emb_maxfreq}) exceeds the Nyquist frequency "
+                f"for the input resolution {H}x{W} (max_modes={max_modes}). "
+                f"sin_emb_nfreq must be <= {max_allowed_nfreq}."
+            )
+
         # Local Branch: positional embedding + initial lifting
         if self.use_positional_grid:
             x_local = self.positional_embedding(x_local)
+            
+            if self.use_sinusoidal_emb:
+                coords = x_local[0:1, -2:, :, :]
+                coords_flat = coords.flatten(2).transpose(1, 2)
+                sin_emb_flat = self.sinusoidal_embedding(coords_flat)
+                sin_emb = sin_emb_flat.transpose(1, 2).view(1, -1, H, W)
+                sin_emb = sin_emb.expand(B, -1, H, W)
+                
+                x_local = torch.cat([x_local, sin_emb], dim=1)
+                
         x = self.lifting(x_local)                           # (B, width, H, W)
 
         # Mix Local & Global: Compute FiLM parameters
@@ -470,6 +507,8 @@ class DualEncoderFNO(nn.Module):
             "lifting_channel_ratio": self.lifting_channel_ratio,
             "projection_channel_ratio": self.projection_channel_ratio,
             "use_positional_grid": self.use_positional_grid,
+            "use_sinusoidal_emb": self.use_sinusoidal_emb,
+            "sin_emb_nfreq": self.sin_emb_nfreq,
             "non_linearity": self.non_linearity,
             "channel_mlp_dropout": self.channel_mlp_dropout,
             "film_per_layer": self.film_per_layer,
@@ -643,7 +682,8 @@ class Trainer:
                 verbose: Optional[bool] = None,
                 ) -> Dict[str, list]:
         """Trains the model for a specified number of epochs with early stopping."""
-
+        
+        start_time = time.time()
         print(f"DualEncoderFNO Training: {epochs} epochs\n")
 
         if verbose is not None:
@@ -708,6 +748,16 @@ class Trainer:
                 break
 
         print(f"\n Training finished. Best epoch: {self.best_epoch} (Loss = {self.best_loss:.6f})")
+        
+        # Training time reporting
+        end_time = time.time()
+        total_time = end_time - start_time
+
+        hours, rem = divmod(total_time, 3600)
+        minutes, seconds = divmod(rem, 60)
+
+        print(f"Total training time: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}")
+        
         return self.history
 
     def plot_history(self, title: str = "DualEncoderFNO Training"):
