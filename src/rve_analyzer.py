@@ -454,7 +454,8 @@ class DualEncoderFNO(nn.Module):
             
             if self.use_sinusoidal_emb:
                 coords = x_local[0:1, -2:, :, :]
-                coords_flat = coords.flatten(2).transpose(1, 2)
+                coords_scaled = coords * 2 * torch.pi
+                coords_flat = coords_scaled.flatten(2).transpose(1, 2)
                 sin_emb_flat = self.sinusoidal_embedding(coords_flat)
                 sin_emb = sin_emb_flat.transpose(1, 2).view(1, -1, H, W)
                 sin_emb = sin_emb.expand(B, -1, H, W)
