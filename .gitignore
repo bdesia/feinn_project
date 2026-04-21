@@ -19,3 +19,4 @@ notebooks/RVEs/strain_histories/*
 notebooks/RVEs/data/*
 notebooks/RVEs/master_data/*
 notebooks/RVEs/wandb/*
+notebooks/RVEs/checkpoints/*
