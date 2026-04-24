@@ -29,6 +29,7 @@ loadenv = "^0.1.1"
 dotenv = "^0.9.9"
 pandas = "^3.0.1"
 plotly = "^6.6.0"
+autoreload = "^0.1.2"
 
 [tool.poetry.group.dev.dependencies]
 ipykernel = "^6.31.0"

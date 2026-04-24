@@ -1162,3 +1162,26 @@ class HomogenizedLoss(object):
             return rel_error.mean() 
         else:
             return self.loss(pred_hom, targ_hom) 
+
+class WeightedVoigtLoss(nn.Module):
+    '''Wrapper for physically consistent loss calculation 
+    on symmetric tensors in Voigt notation.'''
+    
+    def __init__(self, base_loss: Callable):
+        super().__init__()
+        
+        self.base_loss = base_loss
+        weights = [1.0, 1.0, 2.0**0.5]
+        self.register_buffer('weights', torch.tensor(weights, dtype=torch.float32))
+    
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the weighted loss.
+        Supports inputs of shape (Batch, Channels, ...) such as (B, C), (B, C, H, W).
+        """
+        # Dynamic broadcasting for different tensor ranks
+        shape = [1] * prediction.dim()
+        shape[1] = self.weights.shape[0]
+        w = self.weights.view(*shape)
+        
+        return self.base_loss(prediction * w, target * w)
