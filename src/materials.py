@@ -4,10 +4,8 @@ import json
 from typing import Tuple, Optional, Dict, Callable
 
 import torch
-from torch.func import vmap, jacrev
-
-from rve_analyzer import DualEncoderFNO
-from microstrutures_gen import MicrostructureGenerator
+# from torch.func import vmap, jacrev
+# from torchgen import model
 
 class MaterialBase(ABC):
     """
@@ -69,7 +67,6 @@ class MaterialBase(ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Return (stress, state_new, tangent). Tangent = None if isTangent=False."""
         pass
-
 
 class LinearElastic(MaterialBase):
     """
@@ -333,198 +330,137 @@ class NLElasticMatrix(MaterialBase):
 
         return stress, state_old, ddsdde
 
+from rve_analyzer import DualEncoderFNO
+from microstructures import MicrostructurePool
+from microstructures import MicrostructureGenerator
+
 class FNOmat(MaterialBase):
     """
     Surrogate material model based on DualEncoderFNO for FEINN.
-    Evaluates homogenized stress, consistent tangent stiffness, 
-    and tracks maximum localized Von Mises stress per phase.
+    Microstructure pool is built in [0, 1]. 
+    The external fhard function must return values in [0, 1].
     """
-
     def __init__(self,
-                 config_path: str,
-                 normalizer_path: str,
-                 checkpoint_path: str,
-                 micro_generator: MicrostructureGenerator,
-                 chunk_size: int = 4096,
-                 tag: Optional[int] = None,
-                 dtype: torch.dtype = torch.float64,
-                 device: str = 'cpu',
-                 **kwargs):
+                 model: torch.nn.Module,
+                 normalizers: Dict[str, object],
+                 microstructure_pool: MicrostructurePool,
+                 fhard: Callable[[torch.Tensor], torch.Tensor],     # coords → fhard ∈ [0, 1]
+                 chunk_size: int = 512,
+                 n_state: int = 3,
+                 dtype: torch.dtype = torch.float32,
+                 device: str = 'cpu'):
         
-        # Initialize base class with n_state=3:
-        # [0: Microstructure Tag, 1: Max VM Soft, 2: Max VM Hard]
-        super().__init__(n_state=3, dtype=dtype, device=device, tag=tag)
-        
+        super().__init__(n_state=n_state, dtype=dtype, device=device)
+
+        self.model = model.eval().to(device, dtype)
+
+        self.x_normalizer = normalizers['x_normalizer']
+        self.global_normalizer = normalizers['global_normalizer']
+        self.y_normalizer = normalizers['y_normalizer']
+
+        self.pool = microstructure_pool
+        self.fhard = fhard
         self.chunk_size = chunk_size
-        self.micro_generator = micro_generator
+
+        # Normalize pool once
+        self.pool_phase_norm = self.x_normalizer.transform(self.pool.pool_phase)
+
+    def init_state(self, nelem: int, ngp: int, coords: torch.Tensor) -> torch.Tensor:
         
-        # 1. Load Architecture Configuration
-        if str(config_path).endswith('.pth'):
-            cfg = torch.load(config_path, map_location='cpu')
-        else:
-            with open(config_path, 'r') as f:
-                cfg = json.load(f)
-                
-        # Handle nested config dictionaries (e.g., best_params)
-        model_params = cfg if isinstance(cfg, dict) and 'n_modes' in cfg else cfg.get('best_params', cfg)
+        fhard_eval = self.fhard(coords)                                   # debe estar en [0, 1]
 
-        # 2. Instantiate DualEncoderFNO
-        self.model = DualEncoderFNO(
-            in_channels=model_params.get('in_channels', 1),
-            out_channels=model_params.get('out_channels', 3),
-            n_macro=model_params.get('n_macro', 3),
-            n_modes=model_params.get('n_modes', 32),
-            hidden_channels=model_params.get('hidden_channels', 64),
-            n_layers=model_params.get('n_layers', 4),
-            channel_mlp_dropout=model_params.get('channel_mlp_dropout', 0.05),
-            film_mlp_layers=model_params.get('film_mlp_layers', 2),
-            film_mlp_neurons=model_params.get('film_mlp_neurons', 128),
-            film_mlp_dropout=model_params.get('film_mlp_dropout', 0.0),
-            use_sinusoidal_emb=model_params.get('use_sinusoidal_emb', True),
-            sin_emb_nfreq=model_params.get('sin_emb_nfreq', 6),
-            use_positional_grid=True,
-            film_per_layer=True
-        ).to(self.device).to(self.dtype)
+        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
+        tags = torch.argmin(diffs, dim=-1)
 
-        # 3. Load Model Checkpoint (Weights)
-        state_dict = torch.load(checkpoint_path, map_location=self.device)
-        if 'model_state_dict' in state_dict:
-            state_dict = state_dict['model_state_dict']
-        self.model.load_state_dict(state_dict)
-        self.model.eval()
-
-        # 4. Load Normalizers
-        normalizers_dict = torch.load(normalizer_path, map_location=self.device)
-        self.x_normalizer = normalizers_dict['x_normalizer']           # For microstructure image
-        self.global_normalizer = normalizers_dict['global_normalizer'] # For macro strain
-        self.y_normalizer = normalizers_dict['y_normalizer']           # For stress field
-
-        # 5. Internal attributes for spatial caching
-        self.microstructures: Dict[int, Dict[str, torch.Tensor]] = {}
-        self.node_coords: Optional[torch.Tensor] = None
-        self.f_formula = None 
-
-    def register_microstructure(self, tag: int, phase: torch.Tensor, m_soft: torch.Tensor, m_hard: torch.Tensor):
-        """Caches the generated microstructure image and its spatial masks."""
-        self.microstructures[tag] = {
-            'image': phase,
-            'mask_soft': m_soft,
-            'mask_hard': m_hard
-        }
-
-    def init_state(self, nelem: int, ngp2: int, **kwargs) -> torch.Tensor:
-        """Initializes history variables and maps spatial RVEs dynamically."""
-        state = torch.zeros((nelem, ngp2, self.n_state), device=self.device, dtype=self.dtype)
-
-        coords = kwargs.get('coords')
-        if coords is None:
-            raise RuntimeError("FNOmat requires 'coords' in kwargs for init_state.")
-
-        self.node_coords = coords.to(self.device, self.dtype)
-
-        if self.f_formula is None:
-            print("FNOmat: warning - f_formula not set. Returning zero state.")
-            return state
-
-        # Mock Gauss points mapping (replace with element shape functions in production)
-        gp_coords = torch.mean(self.node_coords, dim=1, keepdim=True)
-        coords_flat = gp_coords.view(-1, 2)
-        B = coords_flat.shape[0]
-
-        tags = torch.zeros(B, dtype=torch.long, device=self.device)
-
-        for i in range(B):
-            x, y = coords_flat[i]
-            fhard = float(self.f_formula(x.item(), y.item()))
-            tag = int(round(fhard * 10000))
-
-            if tag not in self.microstructures:
-                phase, m_soft, m_hard = self.micro_generator.generate(fhard, self.device, self.dtype)
-                self.register_microstructure(tag, phase, m_soft, m_hard)
-
-            tags[i] = tag
-
-        state[..., 0] = tags.view(nelem, ngp2)
+        state = torch.zeros((nelem, ngp, self.n_state), 
+                            dtype=self.dtype, device=self.device)
+        state[..., 0] = tags.to(self.dtype)                               # RVE tag
         return state
 
-    def update_state(self, strain: torch.Tensor, state_old: torch.Tensor, isTangent: bool = True) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    def update_state(self, strain: torch.Tensor, state_old: torch.Tensor, isTangent: bool = False):
         """
-        Constitutive evaluation: scales inputs, computes homogenized stress, 
-        evaluates tangent stiffness via autograd, and updates per-phase states.
+        Updates the material state using the FNO surrogate model.
+        Returns homogenized stress and updated internal variables (max Von Mises per phase).
         """
-        nelem, ngp2, _ = strain.shape
-        strain_flat = strain.view(-1, 3)
-        tags_flat = state_old[..., 0].view(-1)
-        B = strain_flat.shape[0]
-
-        stress_out = torch.empty_like(strain_flat)
-        vm_soft_out = torch.empty(B, device=self.device, dtype=self.dtype)
-        vm_hard_out = torch.empty(B, device=self.device, dtype=self.dtype)
-        D_out = torch.empty((B, 3, 3), device=self.device, dtype=self.dtype) if isTangent else None
-        
-        def single_element_forward(s_phys: torch.Tensor, m_phys: torch.Tensor) -> torch.Tensor:
-            """
-            Internal forward mapping for jacrev. 
-            Mapea deformación e imagen física al espacio latente, y devuelve tensión física.
-            """
-            s_norm = self.global_normalizer.transform(s_phys.unsqueeze(0)).squeeze(0)
-            m_norm = self.x_normalizer.transform(m_phys.unsqueeze(0)).squeeze(0)
-            
-            field_norm = self.model(s_norm.unsqueeze(0), m_norm.unsqueeze(0)).squeeze(0) 
-            macro_norm = field_norm.mean(dim=(-2, -1))
-            
-            return self.y_normalizer.inverse_transform(macro_norm.unsqueeze(0)).squeeze(0)
-
+        ddsdde = None
         if isTangent:
-            batched_jacobian_fn = vmap(jacrev(single_element_forward, argnums=0), in_dims=(0, 0))
+            raise NotImplementedError("Tangent stiffness not implemented yet for FNOmat.")
 
-        for i in range(0, B, self.chunk_size):
-            end = min(i + self.chunk_size, B)
-            s_chunk = strain_flat[i:end]
-            t_chunk = tags_flat[i:end]
-            
-            # Fetch cached physical data
-            micro_chunk = torch.stack([self.microstructures[int(t.item())]['image'] for t in t_chunk])
-            mask_soft_chunk = torch.stack([self.microstructures[int(t.item())]['mask_soft'] for t in t_chunk])
-            mask_hard_chunk = torch.stack([self.microstructures[int(t.item())]['mask_hard'] for t in t_chunk])
-            
-            with torch.no_grad(): 
-                # Normalizar entradas físicas para inferencia de campo completo
-                s_chunk_norm = self.global_normalizer.transform(s_chunk)
-                micro_chunk_norm = self.x_normalizer.transform(micro_chunk)
-                
-                # Inferencia pura en espacio latente
-                stress_field_norm = self.model(s_chunk_norm, micro_chunk_norm)
-                
-                # Desnormalizar el campo 2D a espacio físico (MPa)
-                stress_field_phys = self.y_normalizer.inverse_transform(stress_field_norm)
-                stress_out[i:end] = stress_field_phys.mean(dim=(-2, -1))
-                
-                if isTangent:
-                    # El Jacobiano se calcula pasando tensores FÍSICOS a single_element_forward
-                    D_out[i:end] = batched_jacobian_fn(s_chunk, micro_chunk)
+        nelem, ngp, _ = strain.shape
+        N = nelem * ngp
 
-                # Phase-separated Maximum Von Mises Extraction
-                s_xx = stress_field_phys[:, 0, :, :]
-                s_yy = stress_field_phys[:, 1, :, :]
-                s_xy = stress_field_phys[:, 2, :, :]
-                vm_field = torch.sqrt(s_xx**2 - s_xx*s_yy + s_yy**2 + 3*s_xy**2) # (B_chunk, H, W)
+        # Extract local microstructures: (N, C, H, W)
+        tags = state_old[..., 0].long()
+        x_local = self.pool_phase_norm[tags.view(-1)]
+        _, _, H, W = x_local.shape
+        
+        # Normalize global macro-strain
+        x_global = strain.reshape(N, 3)
+        x_global = self.global_normalizer.transform(x_global)
 
-                # Apply exact geometrical masks provided by the generator
-                vm_hard_out[i:end] = (vm_field * mask_hard_chunk).amax(dim=(-2, -1))
-                vm_soft_out[i:end] = (vm_field * mask_soft_chunk).amax(dim=(-2, -1))
-            
-        # Update History Variables
+        # FNO prediction: returns full micromechanical stress field (N, 3, H, W)
+        pred_norm = self._inference_in_chunks(x_local, x_global)
+
+        # Inverse normalization and spatial reshape: (nelem, ngp, 3, H, W)
+        pred_physical = self.y_normalizer.inverse_transform(pred_norm)
+        sigma = pred_physical.view(nelem, ngp, 3, H, W)
+
+        # Homogenization: Spatial average over H (dim=3) and W (dim=4)
+        # Returns macroscopic stress per Gauss point: (nelem, ngp, 3)
+        stress_hom = sigma.mean(dim=(3, 4))
+
+        # Extract maximum micro-stress per phase
+        vm_soft, vm_hard = self._compute_vm_per_phase(sigma, tags, H, W)
+
+        # Update historical state variables with the new maximums
         state_new = state_old.clone()
-        
-        vm_soft_old = state_old[..., 1].view(-1)
-        state_new[..., 1] = torch.maximum(vm_soft_old, vm_soft_out).view(nelem, ngp2)
-        
-        vm_hard_old = state_old[..., 2].view(-1)
-        state_new[..., 2] = torch.maximum(vm_hard_old, vm_hard_out).view(nelem, ngp2)
+        state_new[..., 1] = torch.maximum(state_old[..., 1], vm_soft)
+        state_new[..., 2] = torch.maximum(state_old[..., 2], vm_hard)
 
-        # Reshape to element batch dimensions
-        stress_res = stress_out.view(nelem, ngp2, 3)
-        ddsdde_res = D_out.view(nelem, ngp2, 3, 3) if isTangent else None
+        return stress_hom, state_new, ddsdde
 
-        return stress_res, state_new, ddsdde_res
+    def _inference_in_chunks(self, x_local: torch.Tensor, x_global: torch.Tensor) -> torch.Tensor:
+        """
+        Performs batched inference to prevent GPU Out-Of-Memory (OOM) errors.
+        Returns the full spatial prediction tensor.
+        """
+        N, _, H, W = x_local.shape
+        pred = torch.zeros((N, 3, H, W), dtype=self.dtype, device=self.device)
+
+        for i in range(0, N, self.chunk_size):
+            j = min(i + self.chunk_size, N)
+            with torch.no_grad():
+                pred[i:j] = self.model(x_local[i:j], x_global[i:j])
+                
+        return pred
+
+    def _compute_vm_per_phase(self, sigma: torch.Tensor, tags: torch.Tensor, H: int, W: int):
+        """
+        Computes the maximum Von Mises stress for the soft and hard phases
+        by applying spatial masks to the full micro-stress field.
+        """
+        nelem, ngp, _, _, _ = sigma.shape
+        
+        # Retrieve and reshape masks to match integration points geometry
+        tags_flat = tags.view(-1)
+        mask_soft, mask_hard = self.pool.get_masks(tags_flat)
+        
+        mask_soft = mask_soft.view(nelem, ngp, H, W)
+        mask_hard = mask_hard.view(nelem, ngp, H, W)
+
+        # Extract individual stress components
+        sxx = sigma[:, :, 0, :, :]
+        syy = sigma[:, :, 1, :, :]
+        sxy = sigma[:, :, 2, :, :]
+
+        # Compute the full Von Mises micro-field
+        vm_sq = sxx**2 + syy**2 - sxx*syy + 3 * sxy**2
+
+        # Apply phase masks (zeros out the other phase) and find the spatial maximum
+        vm_sq_soft_max = (vm_sq * mask_soft).amax(dim=(2, 3))
+        vm_sq_hard_max = (vm_sq * mask_hard).amax(dim=(2, 3))
+
+        vm_soft_max = torch.sqrt(vm_sq_soft_max)
+        vm_hard_max = torch.sqrt(vm_sq_hard_max)
+
+        return vm_soft_max, vm_hard_max
