@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
 
 class Mesh2D:
     """
@@ -495,3 +496,73 @@ class UniformQuadMesh2D(Mesh2D):
         self.element_groups['top'] = list(range(self.nx * (self.ny-1) + 1, self.nx * self.ny + 1))
         self.element_groups['left'] = list(range(1, (self.ny - 1) * self.nx + 2, self.nx))
         self.element_groups['right'] = list(range(self.nx, self.ny * self.nx + 1, self.nx))
+
+# ---------------------------------------------------------
+# UTILITIES
+# ---------------------------------------------------------
+
+def get_periodic_pairs_kdtree(mesh, delta_x: float = None, delta_y: float = None, tol=1e-8):
+    """
+    Finds periodic node pairs (Left-Right, Bottom-Top) using KD-Tree for fast spatial querying.
+    
+    Args:
+        mesh: Mesh2D object containing coordinates, dimensions (lx, ly), and node groups.
+        tol (float): Spatial tolerance for matching nodes.
+        
+    Returns:
+        tuple: Two lists of paired node IDs (1-based format) -> (pairs_left_right, pairs_bottom_top).
+    """
+    # Get all coordinates as a numpy array
+    coords = np.array(mesh.coordinates)
+    
+    if delta_x is None:
+        delta_x = max(coords[:, 0]) - min(coords[:, 0])
+    if delta_y is None:
+        delta_y = max(coords[:, 1]) - min(coords[:, 1])
+
+    # Extract 0-based indices for boundary nodes (Mesh2D uses 1-based IDs)
+    left_idx = np.array(list(mesh.node_groups['Xmin_n'])) - 1
+    right_idx = np.array(list(mesh.node_groups['Xmax_n'])) - 1
+    bottom_idx = np.array(list(mesh.node_groups['Ymin_n'])) - 1
+    top_idx = np.array(list(mesh.node_groups['Ymax_n'])) - 1
+    
+    coords_left, coords_right = coords[left_idx], coords[right_idx]
+    coords_bottom, coords_top = coords[bottom_idx], coords[top_idx]
+    
+    # ---------------------------------------------------------
+    # LEFT-RIGHT PAIRING (X-axis)
+    # ---------------------------------------------------------
+    # Shift left boundary nodes by Lx to overlap the right boundary
+    shifted_left = coords_left.copy()
+    shifted_left[:, 0] += delta_x  
+    
+    # Build KD-Tree for right boundary and query matches
+    tree_right = cKDTree(coords_right)
+    distances_lr, indices_lr = tree_right.query(shifted_left, distance_upper_bound=tol)
+    valid_lr = distances_lr < tol
+    
+    # Construct pairs and restore 1-based indexing
+    left_nodes = (left_idx[valid_lr] + 1).tolist()
+    right_nodes = (right_idx[indices_lr[valid_lr]] + 1).tolist()
+
+    pairs_left_right = list(zip(left_nodes, right_nodes))
+    
+    # ---------------------------------------------------------
+    # BOTTOM-TOP PAIRING (Y-axis)
+    # ---------------------------------------------------------
+    # Shift bottom boundary nodes by Ly to overlap the top boundary
+    shifted_bottom = coords_bottom.copy()
+    shifted_bottom[:, 1] += delta_y 
+    
+    # Build KD-Tree for top boundary and query matches
+    tree_top = cKDTree(coords_top)
+    distances_bt, indices_bt = tree_top.query(shifted_bottom, distance_upper_bound=tol)
+    valid_bt = distances_bt < tol
+    
+    # Construct pairs and restore 1-based indexing
+    bottom_nodes = (bottom_idx[valid_bt] + 1).tolist()
+    top_nodes = (top_idx[indices_bt[valid_bt]] + 1).tolist()    
+    
+    pairs_bottom_top = list(zip(bottom_nodes, top_nodes))
+    
+    return pairs_left_right, pairs_bottom_top
