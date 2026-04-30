@@ -189,8 +189,12 @@ class QuadElement(MasterElement):
 
         # Initialize material state variables
         if self.material is not None:
-            self.state = self.material.init_state(self.nelem, self.ngp2)
-
+            self.state = self.material.init_state(
+                self.nelem, 
+                self.ngp2, 
+                coords=self.X,       # Nodal coordinates for spatial-aware materials
+                elem_ids=self.ids    # Element IDs
+            )
     def compute_jacobian(self, r: torch.Tensor, s: torch.Tensor):   
         dHrs = QuadShapeDerivatives(r, s, self.nnode)                           # (ngp², 2, nnode)
         J = torch.einsum('gij,ejk->egik', dHrs, self.X)                         # (nelem, ngp², 2, 2)

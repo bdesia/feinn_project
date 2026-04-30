@@ -5,6 +5,54 @@ import matplotlib.pyplot as plt
 from abc import ABC, abstractmethod
 from typing import Tuple
 
+class MicrostructurePool:
+    """
+    Precomputes a pool of raw microstructures (phase + masks) indexed by fhard.
+    """
+    def __init__(self,
+                 generator: object,
+                 fhard_bins: torch.Tensor,
+                 device: str = 'cpu',
+                 dtype: torch.dtype = torch.float64):
+        
+        self.device = device
+        self.dtype = dtype
+        self.fhard_bins = fhard_bins.to(device=device, dtype=dtype)
+        self.num_bins = len(fhard_bins)
+
+        print(f"Building MicrostructurePool with {self.num_bins} bins...")
+
+        pool_phase = []
+        pool_mask_soft = []
+        pool_mask_hard = []
+
+        for i, f in enumerate(self.fhard_bins):
+            phase, mask_soft, mask_hard = generator.generate(
+                f.item(), device=device, dtype=dtype
+            )
+            
+            pool_phase.append(phase)
+            pool_mask_soft.append(mask_soft)
+            pool_mask_hard.append(mask_hard)
+
+            if (i + 1) % 5 == 0 or i == self.num_bins - 1:
+                print(f"   → {i+1:2d}/{self.num_bins} microstructures generated")
+
+        self.pool_phase = torch.stack(pool_phase)      # (num_bins, C, H, W) raw
+        self.pool_mask_soft = torch.stack(pool_mask_soft)
+        self.pool_mask_hard = torch.stack(pool_mask_hard)
+
+        print(f"MicrostructurePool ready | Shape: {self.pool_phase.shape}")
+
+    def get_rves(self, tags: torch.Tensor) -> torch.Tensor:
+        """tags (nelem, ngp) → raw RVEs (nelem*ngp, C, H, W)"""
+        return self.pool_phase[tags.view(-1).long()]
+
+    def get_masks(self, tags: torch.Tensor):
+        """Return soft and hard masks for given tags"""
+        idx = tags.view(-1).long()
+        return self.pool_mask_soft[idx], self.pool_mask_hard[idx]
+
 class MicrostructureGenerator(ABC):
     """
     Abstract base class for RVE microstructure generators.

@@ -1,6 +1,11 @@
-import torch
+
 from abc import ABC, abstractmethod
-from typing import Tuple, Optional
+import json
+from typing import Tuple, Optional, Dict, Callable
+
+import torch
+# from torch.func import vmap, jacrev
+# from torchgen import model
 
 class MaterialBase(ABC):
     """
@@ -38,10 +43,20 @@ class MaterialBase(ABC):
                 setattr(self, attr_name, attr_value.to(dtype=self.dtype, device=self.device))
         return self
 
-    def init_state(self, nelem: int, ngp2: int) -> torch.Tensor:
-        """Initialize the state tensor."""
-        return torch.zeros((nelem, ngp2, self.n_state),
-                           device=self.device, dtype=self.dtype)
+    def init_state(self, nelem: int, ngp2: int, **kwargs) -> torch.Tensor:
+        """
+        Initialize material history variables.
+
+        Args:
+            nelem: Number of elements in the batch.
+            ngp2: Number of Gauss points per element.
+            **kwargs: Optional context dict (e.g., coords, temperature).
+            
+        Returns:
+            State tensor of shape (nelem, ngp2, n_state).
+        """
+        # Default behavior: return zero tensor for standard materials
+        return torch.zeros((nelem, ngp2, self.n_state), device=self.device, dtype=self.dtype)
 
     @abstractmethod
     def update_state(
@@ -52,7 +67,6 @@ class MaterialBase(ABC):
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Return (stress, state_new, tangent). Tangent = None if isTangent=False."""
         pass
-
 
 class LinearElastic(MaterialBase):
     """
@@ -315,3 +329,138 @@ class NLElasticMatrix(MaterialBase):
             ddsdde = self.get_constitutive_matrix(strain)
 
         return stress, state_old, ddsdde
+
+from rve_analyzer import DualEncoderFNO
+from microstructures import MicrostructurePool
+from microstructures import MicrostructureGenerator
+
+class FNOmat(MaterialBase):
+    """
+    Surrogate material model based on DualEncoderFNO for FEINN.
+    Microstructure pool is built in [0, 1]. 
+    The external fhard function must return values in [0, 1].
+    """
+    def __init__(self,
+                 model: torch.nn.Module,
+                 normalizers: Dict[str, object],
+                 microstructure_pool: MicrostructurePool,
+                 fhard: Callable[[torch.Tensor], torch.Tensor],     # coords → fhard ∈ [0, 1]
+                 chunk_size: int = 512,
+                 n_state: int = 3,
+                 dtype: torch.dtype = torch.float32,
+                 device: str = 'cpu'):
+        
+        super().__init__(n_state=n_state, dtype=dtype, device=device)
+
+        self.model = model.eval().to(device, dtype)
+
+        self.x_normalizer = normalizers['x_normalizer']
+        self.global_normalizer = normalizers['global_normalizer']
+        self.y_normalizer = normalizers['y_normalizer']
+
+        self.pool = microstructure_pool
+        self.fhard = fhard
+        self.chunk_size = chunk_size
+
+        # Normalize pool once
+        self.pool_phase_norm = self.x_normalizer.transform(self.pool.pool_phase)
+
+    def init_state(self, nelem: int, ngp: int, coords: torch.Tensor) -> torch.Tensor:
+        
+        fhard_eval = self.fhard(coords)                                   # debe estar en [0, 1]
+
+        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
+        tags = torch.argmin(diffs, dim=-1)
+
+        state = torch.zeros((nelem, ngp, self.n_state), 
+                            dtype=self.dtype, device=self.device)
+        state[..., 0] = tags.to(self.dtype)                               # RVE tag
+        return state
+
+    def update_state(self, strain: torch.Tensor, state_old: torch.Tensor, isTangent: bool = False):
+        """
+        Updates the material state using the FNO surrogate model.
+        Returns homogenized stress and updated internal variables (max Von Mises per phase).
+        """
+        ddsdde = None
+        if isTangent:
+            raise NotImplementedError("Tangent stiffness not implemented yet for FNOmat.")
+
+        nelem, ngp, _ = strain.shape
+        N = nelem * ngp
+
+        # Extract local microstructures: (N, C, H, W)
+        tags = state_old[..., 0].long()
+        x_local = self.pool_phase_norm[tags.view(-1)]
+        _, _, H, W = x_local.shape
+        
+        # Normalize global macro-strain
+        x_global = strain.reshape(N, 3)
+        x_global = self.global_normalizer.transform(x_global)
+
+        # FNO prediction: returns full micromechanical stress field (N, 3, H, W)
+        pred_norm = self._inference_in_chunks(x_local, x_global)
+
+        # Inverse normalization and spatial reshape: (nelem, ngp, 3, H, W)
+        pred_physical = self.y_normalizer.inverse_transform(pred_norm)
+        sigma = pred_physical.view(nelem, ngp, 3, H, W)
+
+        # Homogenization: Spatial average over H (dim=3) and W (dim=4)
+        # Returns macroscopic stress per Gauss point: (nelem, ngp, 3)
+        stress_hom = sigma.mean(dim=(3, 4))
+
+        # Extract maximum micro-stress per phase
+        vm_soft, vm_hard = self._compute_vm_per_phase(sigma, tags, H, W)
+
+        # Update historical state variables with the new maximums
+        state_new = state_old.clone()
+        state_new[..., 1] = torch.maximum(state_old[..., 1], vm_soft)
+        state_new[..., 2] = torch.maximum(state_old[..., 2], vm_hard)
+
+        return stress_hom, state_new, ddsdde
+
+    def _inference_in_chunks(self, x_local: torch.Tensor, x_global: torch.Tensor) -> torch.Tensor:
+        """
+        Performs batched inference to prevent GPU Out-Of-Memory (OOM) errors.
+        Returns the full spatial prediction tensor.
+        """
+        N, _, H, W = x_local.shape
+        pred = torch.zeros((N, 3, H, W), dtype=self.dtype, device=self.device)
+
+        for i in range(0, N, self.chunk_size):
+            j = min(i + self.chunk_size, N)
+            with torch.no_grad():
+                pred[i:j] = self.model(x_local[i:j], x_global[i:j])
+                
+        return pred
+
+    def _compute_vm_per_phase(self, sigma: torch.Tensor, tags: torch.Tensor, H: int, W: int):
+        """
+        Computes the maximum Von Mises stress for the soft and hard phases
+        by applying spatial masks to the full micro-stress field.
+        """
+        nelem, ngp, _, _, _ = sigma.shape
+        
+        # Retrieve and reshape masks to match integration points geometry
+        tags_flat = tags.view(-1)
+        mask_soft, mask_hard = self.pool.get_masks(tags_flat)
+        
+        mask_soft = mask_soft.view(nelem, ngp, H, W)
+        mask_hard = mask_hard.view(nelem, ngp, H, W)
+
+        # Extract individual stress components
+        sxx = sigma[:, :, 0, :, :]
+        syy = sigma[:, :, 1, :, :]
+        sxy = sigma[:, :, 2, :, :]
+
+        # Compute the full Von Mises micro-field
+        vm_sq = sxx**2 + syy**2 - sxx*syy + 3 * sxy**2
+
+        # Apply phase masks (zeros out the other phase) and find the spatial maximum
+        vm_sq_soft_max = (vm_sq * mask_soft).amax(dim=(2, 3))
+        vm_sq_hard_max = (vm_sq * mask_hard).amax(dim=(2, 3))
+
+        vm_soft_max = torch.sqrt(vm_sq_soft_max)
+        vm_hard_max = torch.sqrt(vm_sq_hard_max)
+
+        return vm_soft_max, vm_hard_max
