@@ -521,10 +521,10 @@ def get_periodic_pairs_kdtree(mesh, delta_x: float = None, delta_y: float = None
         delta_y = max(coords[:, 1]) - min(coords[:, 1])
 
     # Extract 0-based indices for boundary nodes (Mesh2D uses 1-based IDs)
-    left_idx = np.array(list(mesh.node_groups['Xmin_n'])) - 1
-    right_idx = np.array(list(mesh.node_groups['Xmax_n'])) - 1
-    bottom_idx = np.array(list(mesh.node_groups['Ymin_n'])) - 1
-    top_idx = np.array(list(mesh.node_groups['Ymax_n'])) - 1
+    left_idx = np.array(list(mesh.node_groups['left'])) - 1
+    right_idx = np.array(list(mesh.node_groups['right'])) - 1
+    bottom_idx = np.array(list(mesh.node_groups['bottom'])) - 1
+    top_idx = np.array(list(mesh.node_groups['top'])) - 1
     
     coords_left, coords_right = coords[left_idx], coords[right_idx]
     coords_bottom, coords_top = coords[bottom_idx], coords[top_idx]
