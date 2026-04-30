@@ -1,3 +1,4 @@
+from mesher import Mesh2D
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -111,7 +112,52 @@ class MicrostructureGenerator(ABC):
         plt.tight_layout()
         plt.show()
 
+    def to_mesh(self, 
+                lx: float = 0.10,
+                ly: float = 0.10, 
+                fhard: float = 0.3,
+                device: str = "cpu", 
+                dtype: torch.dtype = torch.float64) -> 'Mesh2D':
+        """
+        Convert voxel-based microstructure into a Q4 finite element mesh.
+        
+        Creates element groups:
+            - 'soft_s' : soft phase (matrix)
+            - 'hard_s' : hard phase (inclusions)
+        
+        Also adds standard boundary node groups compatible with periodic pairing.
+        """
+        from mesher import UniformQuadMesh2D, get_periodic_pairs_kdtree
 
+        # Generate microstructure
+        phase, mask_soft, mask_hard = self.generate(fhard, device=device, dtype=dtype)
+        
+        # Create uniform Q4 mesh
+        mesh = UniformQuadMesh2D(lx=lx, ly=ly, nx=self.res, ny=self.res, elem_type='Q4')
+        mesh.compute()
+
+        # Assign material groups based on voxel values
+        mask_hard_np = mask_hard.cpu().numpy()  # (res, res)
+        
+        hard_elems = []
+        soft_elems = []
+        
+        for j in range(self.res):
+            for i in range(self.res):
+                elem_id = j * self.res + i + 1  # 1-based, row-major
+                if mask_hard_np[j, i] > 0.5:
+                    hard_elems.append(elem_id)
+                else:
+                    soft_elems.append(elem_id)
+        
+        mesh.add_element_group('hard_s', hard_elems)
+        mesh.add_element_group('soft_s', soft_elems)
+
+        # Generate boundary node groups for periodicity
+        left_right_pairs, bottom_top_pairs = get_periodic_pairs_kdtree(mesh, delta_x=lx, delta_y=ly)
+
+        return mesh, left_right_pairs, bottom_top_pairs
+    
 # ==========================================
 # IMPLEMENTATIONS
 # ==========================================
