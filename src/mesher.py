@@ -404,12 +404,14 @@ class UniformQuadMesh2D(Mesh2D):
             a = 0.5
 
         # x1 = np.arange(0, self.lx + a * step1, a * step1)
-        x2 = np.arange(0, self.ly + step2, step2)
+        n_points_y = int(round(self.ly / step2)) + 1
+        x2 = np.linspace(0, self.ly, n_points_y)
 
         coordinates = []
         k = 1
         for j in x2:
-            for i in np.arange(0, self.lx + (step1 * a), step1 * a):
+            n_points_x = int(round(self.lx / (step1 * a))) + 1
+            for i in np.linspace(0, self.lx, n_points_x):
                 coordinates.append([i, j])
                 k += 1
             if npe == 8:
