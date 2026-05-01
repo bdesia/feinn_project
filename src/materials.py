@@ -330,9 +330,7 @@ class NLElasticMatrix(MaterialBase):
 
         return stress, state_old, ddsdde
 
-from rve_analyzer import DualEncoderFNO
 from microstructures import MicrostructurePool
-from microstructures import MicrostructureGenerator
 
 class FNOmat(MaterialBase):
     """
