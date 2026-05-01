@@ -65,6 +65,10 @@ class MicrostructureGenerator(ABC):
             resolution (int): Grid size for the Neural Operator (must match DataLoader).
         """
         self.res = resolution
+        
+        self.phase_tensor = None
+        self.mask_soft = None
+        self.mask_hard = None
 
     @abstractmethod
     def generate(self, fhard: float, device: str = "cpu", dtype: torch.dtype = torch.float64) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -78,16 +82,15 @@ class MicrostructureGenerator(ABC):
         """
         pass
 
-    def plot(self, fhard: float, title: str = "RVE Microstructure") -> None:
+    def plot(self, title: str = "RVE Microstructure") -> None:
         """
         Visualizes the generated RVE and its geometric phase masks.
         """
-        phase, m_soft, m_hard = self.generate(fhard)
         
         # Convert to numpy for matplotlib
-        phase_np = phase.squeeze(0).cpu().numpy()
-        ms_np = m_soft.cpu().numpy()
-        mh_np = m_hard.cpu().numpy()
+        phase_np = self.phase_tensor.squeeze(0).cpu().numpy()
+        ms_np = self.mask_soft.cpu().numpy()
+        mh_np = self.mask_hard.cpu().numpy()
 
         fig, ax = plt.subplots(1, 3, figsize=(15, 5))
         
@@ -97,12 +100,12 @@ class MicrostructureGenerator(ABC):
         plt.colorbar(im0, ax=ax[0], fraction=0.046, pad=0.04)
 
         # 2. Soft Mask
-        im1 = ax[1].imshow(ms_np, cmap='gray', origin='lower')
+        im1 = ax[1].imshow(ms_np, cmap='gray_r', origin='lower')
         ax[1].set_title("Soft Mask (Matrix)")
         plt.colorbar(im1, ax=ax[1], fraction=0.046, pad=0.04)
 
         # 3. Hard Mask
-        im2 = ax[2].imshow(mh_np, cmap='gray', origin='lower')
+        im2 = ax[2].imshow(mh_np, cmap='gray_r', origin='lower')
         ax[2].set_title("Hard Mask (Inclusion)")
         plt.colorbar(im2, ax=ax[2], fraction=0.046, pad=0.04)
 
@@ -112,49 +115,67 @@ class MicrostructureGenerator(ABC):
         plt.tight_layout()
         plt.show()
 
-    def to_mesh(self, 
-                lx: float = 0.10,
-                ly: float = 0.10, 
-                fhard: float = 0.3,
-                device: str = "cpu", 
-                dtype: torch.dtype = torch.float64) -> 'Mesh2D':
+    def to_mesh(self,
+                lx: float,
+                ly: float,
+                device: str = "cpu",
+                dtype: torch.dtype = torch.float64,
+                verbose: bool = False) -> Tuple['Mesh2D', list, list]:
         """
-        Convert voxel-based microstructure into a Q4 finite element mesh.
+        Convert voxel-based microstructure into a coarser Q4 finite element mesh.
         
-        Creates element groups:
-            - 'soft_s' : soft phase (matrix)
-            - 'hard_s' : hard phase (inclusions)
+        - Mesh resolution = voxel_resolution / 2  (2×2 voxels per element)
+        - Element material assigned by majority vote in each 2x2 voxel block.
         
-        Also adds standard boundary node groups compatible with periodic pairing.
+        Returns:
+            mesh, pairs_left_right, pairs_bottom_top
         """
         from mesher import UniformQuadMesh2D, get_periodic_pairs_kdtree
 
-        # Generate microstructure
-        phase, mask_soft, mask_hard = self.generate(fhard, device=device, dtype=dtype)
-        
-        # Create uniform Q4 mesh
-        mesh = UniformQuadMesh2D(lx=lx, ly=ly, nx=self.res, ny=self.res, elem_type='Q4')
+        # Ensure microstructure exists
+        if self.mask_hard is None:
+            self.generate(0.3, device=device, dtype=dtype)
+
+        # Coarser mesh: half resolution (2 voxels per element)
+        nelem_by_side = int(0.5 * self.res)
+        mesh = UniformQuadMesh2D(lx=lx, ly=ly, nx=nelem_by_side, ny=nelem_by_side, elem_type='Q4')
         mesh.compute()
 
-        # Assign material groups based on voxel values
-        mask_hard_np = mask_hard.cpu().numpy()  # (res, res)
+        # Assign material groups - 2x2 voxel to 1 element mapping
+        mask_hard_np = self.mask_hard.cpu().numpy()  # shape: (res, res)
         
         hard_elems = []
         soft_elems = []
         
-        for j in range(self.res):
-            for i in range(self.res):
-                elem_id = j * self.res + i + 1  # 1-based, row-major
-                if mask_hard_np[j, i] > 0.5:
+        step = 2  # voxels per element
+        for j in range(nelem_by_side):      # mesh row
+            for i in range(nelem_by_side):  # mesh column
+                # Extract 2x2 block from voxel grid
+                block = mask_hard_np[j*step : (j+1)*step, i*step : (i+1)*step]
+                
+                # Majority vote
+                hard_fraction = block.mean()
+                elem_id = j * nelem_by_side + i + 1   # 1-based, row-major
+                
+                if hard_fraction > 0.5:
                     hard_elems.append(elem_id)
                 else:
                     soft_elems.append(elem_id)
-        
+
         mesh.add_element_group('hard_s', hard_elems)
         mesh.add_element_group('soft_s', soft_elems)
 
-        # Generate boundary node groups for periodicity
-        left_right_pairs, bottom_top_pairs = get_periodic_pairs_kdtree(mesh, delta_x=lx, delta_y=ly)
+        mesh.add_node_group('fixed_n', [1])
+        
+        # Periodic boundary pairs
+        left_right_pairs, bottom_top_pairs = get_periodic_pairs_kdtree(
+            mesh, delta_x=lx, delta_y=ly
+        )
+
+        if verbose:
+            print(f"to_mesh() → {nelem_by_side}×{nelem_by_side} Q4 elements "
+                f"({self.res}×{self.res} voxels) | "
+                f"hard_s: {len(hard_elems)} | soft_s: {len(soft_elems)}")
 
         return mesh, left_right_pairs, bottom_top_pairs
     
@@ -179,12 +200,11 @@ class CentralFiber(MicrostructureGenerator):
         dist = torch.sqrt((X - 0.5)**2 + (Y - 0.5)**2)
         
         # Masks generation without boolean casting issues
-        mask_hard = (dist <= radius).to(dtype)
-        mask_soft = 1.0 - mask_hard
-        phase_tensor = mask_hard.unsqueeze(0)
+        self.mask_hard = (dist <= radius).to(dtype)
+        self.mask_soft = 1.0 - self.mask_hard
+        self.phase_tensor = self.mask_hard.unsqueeze(0)
         
-        return phase_tensor, mask_soft, mask_hard
-
+        return self.phase_tensor, self.mask_soft, self.mask_hard
 
 class CentralCornerFiber(MicrostructureGenerator):
     """
@@ -206,15 +226,14 @@ class CentralCornerFiber(MicrostructureGenerator):
         dist_tr = torch.sqrt((X - 1.0)**2 + (Y - 1.0)**2)
         
         # Union of geometries (Logical OR)
-        mask_hard = ( (dist_c <= radius) | (dist_bl <= radius) | 
+        self.mask_hard = ( (dist_c <= radius) | (dist_bl <= radius) | 
                       (dist_br <= radius) | (dist_tl <= radius) | 
                       (dist_tr <= radius) ).to(dtype)
         
-        mask_soft = 1.0 - mask_hard
-        phase_tensor = mask_hard.unsqueeze(0)
+        self.mask_soft = 1.0 - self.mask_hard
+        self.phase_tensor = self.mask_hard.unsqueeze(0)
         
-        return phase_tensor, mask_soft, mask_hard
-
+        return self.phase_tensor, self.mask_soft, self.mask_hard
 
 class RandomBlocks(MicrostructureGenerator):
     """
@@ -235,9 +254,69 @@ class RandomBlocks(MicrostructureGenerator):
         
         # Convert to tensor and upsample to full resolution natively in PyTorch
         coarse_t = coarse.unsqueeze(0).unsqueeze(0)
-        phase_tensor = F.interpolate(coarse_t, size=(self.res, self.res), mode='nearest').squeeze(0)
+        self.phase_tensor = F.interpolate(coarse_t, size=(self.res, self.res), mode='nearest').squeeze(0)
         
-        mask_hard = (phase_tensor.squeeze(0) > 0.5).to(dtype) 
-        mask_soft = 1.0 - mask_hard
+        self.mask_hard = (self.phase_tensor.squeeze(0) > 0.5).to(dtype) 
+        self.mask_soft = 1.0 - self.mask_hard
+        
+        return self.phase_tensor, self.mask_soft, self.mask_hard
+    
+import torch
+from typing import Tuple
 
-        return phase_tensor, mask_soft, mask_hard
+class Layered(MicrostructureGenerator):
+    """
+    Generates a layered (striped) microstructure with controllable orientation and frequency.
+    """
+    
+    def __init__(self, resolution: int = 96, angle: float = 0.0, n_layers: int = 8):
+        """
+        Args:
+            resolution (int): Grid size (res x res).
+            angle (float): Lamination angle in degrees (0° = horizontal, 90° = vertical).
+            n_layers (int): Number of repeating hard/soft layer pairs.
+        """
+        super().__init__(resolution)
+        self.angle = angle
+        self.n_layers = max(1, n_layers)
+
+    def generate(self, fhard: float, device: str = "cpu", dtype: torch.dtype = torch.float64) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Generates the Representative Volume Element (RVE).
+        
+        Args:
+            fhard (float): Volume fraction of the hard phase [0.0, 1.0].
+            device (str): Computation device ('cpu' or 'cuda').
+            dtype (torch.dtype): Data type for the tensors.
+            
+        Returns:
+            Tuple containing phase_tensor, mask_soft, and mask_hard.
+        """
+        # Clamp volume fraction to valid range
+        fhard = max(0.0, min(1.0, fhard))
+
+        # Calculate normal vector for layer orientation
+        # 0° -> nx=0, ny=1 (variation along Y -> horizontal layers)
+        # 90° -> nx=1, ny=0 (variation along X -> vertical layers)
+        theta = torch.tensor(self.angle * torch.pi / 180.0, device=device, dtype=dtype)
+        nx = torch.sin(theta)
+        ny = torch.cos(theta)
+
+        # Create an evenly spaced periodic grid in [0, 1)
+        coords = torch.arange(self.res, device=device, dtype=dtype) / self.res
+        Y, X = torch.meshgrid(coords, coords, indexing='ij')
+
+        # Project coordinates onto the normal vector and scale by frequency
+        proj = X * nx + Y * ny
+        scaled = proj * self.n_layers
+        
+        # CRITICAL FIX: Use modulo 1.0 instead of torch.frac()
+        # This properly handles negative projections by wrapping them to [0, 1)
+        frac = scaled % 1.0
+
+        # Generate binary masks based on the volume fraction threshold
+        self.mask_hard = (frac < fhard).to(dtype)
+        self.mask_soft = 1.0 - self.mask_hard
+        self.phase_tensor = self.mask_hard.unsqueeze(0)
+
+        return self.phase_tensor, self.mask_soft, self.mask_hard
