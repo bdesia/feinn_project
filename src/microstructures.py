@@ -82,6 +82,43 @@ class MicrostructureGenerator(ABC):
         """
         pass
 
+    def resize(self, new_resolution: int) -> None:
+        """
+        Resizes the generated microstructure to a new resolution using nearest-neighbor interpolation.
+        Interpolates only the phase tensor and re-derives masks to ensure exact boolean partitions.
+
+        Args:
+            new_resolution (int): Target resolution (new_resolution x new_resolution).
+        """
+        if self.phase_tensor is None or self.mask_soft is None or self.mask_hard is None:
+            raise RuntimeError("No microstructure generated yet. Call generate() first.")
+        
+        if new_resolution <= 0:
+            raise ValueError("new_resolution must be a positive integer.")
+            
+        if self.res == new_resolution:
+            print(f"Already at resolution {new_resolution}x{new_resolution}. No changes made.")
+            return
+
+        # Prepare tensor for F.interpolate: (1, H, W) -> (1, 1, H, W)
+        inp = self.phase_tensor.unsqueeze(0)
+        
+        # Apply nearest interpolation to preserve exact 0.0/1.0 values
+        out = F.interpolate(inp, size=(new_resolution, new_resolution), mode='nearest')
+        
+        # Update phase_tensor: (1, 1, new_res, new_res) -> (1, new_res, new_res)
+        self.phase_tensor = out.squeeze(0)
+        
+        # Re-derive masks to guarantee mask_hard + mask_soft == 1.0
+        self.mask_hard = self.phase_tensor.squeeze(0)
+        self.mask_soft = 1.0 - self.mask_hard
+        
+        # Update internal resolution
+        old_res = self.res
+        self.res = new_resolution
+        
+        print(f"Microstructure resized: {old_res}x{old_res} → {new_resolution}x{new_resolution}")
+
     def plot(self, title: str = "RVE Microstructure") -> None:
         """
         Visualizes the generated RVE and its geometric phase masks.
