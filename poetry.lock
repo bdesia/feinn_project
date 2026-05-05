@@ -4249,7 +4249,6 @@ files = [
     {file = "setuptools-82.0.1-py3-none-any.whl", hash = "sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb"},
     {file = "setuptools-82.0.1.tar.gz", hash = "sha256:7d872682c5d01cfde07da7bccc7b65469d3dca203318515ada1de5eda35efbf9"},
 ]
-markers = {main = "python_version >= \"3.12\""}
 
 [package.extras]
 check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1) ; sys_platform != \"cygwin\"", "ruff (>=0.13.0) ; sys_platform != \"cygwin\""]
@@ -4920,4 +4919,4 @@ test = ["pytest", "pytest-mock"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.11"
-content-hash = "8c8a16445952cd312a0b09a1d5edee29c43eecb5d46fe43dee880cc39fc4e368"
+content-hash = "ba778a98ceee045d1b432165d913fff1ce6e647a09dbac4029984281693de2a1"
