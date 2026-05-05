@@ -4,6 +4,7 @@ import json
 from typing import Tuple, Optional, Dict, Callable
 
 import torch
+from torch.utils.checkpoint import checkpoint
 # from torch.func import vmap, jacrev
 # from torchgen import model
 
@@ -332,133 +333,183 @@ class NLElasticMatrix(MaterialBase):
 
 from microstructures import MicrostructurePool
 
+class PartialGradientFNO(torch.autograd.Function):
+    """
+    Custom autograd function for memory-efficient training.
+    Performs a graph-free forward pass and computes backward gradients 
+    only with respect to the global strain (x_global).
+    """
+    @staticmethod
+    def forward(ctx, model, x_local, x_global):
+        """ 
+        No gradient tracking in forward pass to save memory. 
+        """
+        ctx.save_for_backward(x_global)     # Save only global strain for backward pass
+        ctx.model = model                   # Save model for backward pass
+        ctx.x_local = x_local.detach()      # Detach local features to prevent gradient tracking (no gradients needed for x_local)
+
+        # Enforce float32 to prevent cuFFT errors on non-power-of-2 grids
+        x_local_f32 = x_local.contiguous().to(torch.float32)
+        x_global_f32 = x_global.contiguous().to(torch.float32)
+
+        with torch.no_grad():
+            output = model(x_local_f32, x_global_f32)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        
+        # Retrieve saved tensors and model from saved context
+        x_global = ctx.saved_tensors[0]
+        model = ctx.model
+        x_local = ctx.x_local
+
+        with torch.enable_grad():
+            # Locally rebuild the graph for the backward pass
+            x_g_tmp = x_global.detach().to(torch.float32).requires_grad_(True)
+            out_tmp = model(x_local.to(torch.float32), x_g_tmp)
+
+            grad_x_global = torch.autograd.grad(
+                out_tmp, x_g_tmp,
+                grad_outputs=grad_output.to(torch.float32),
+                retain_graph=False
+            )[0]
+
+        return None, None, grad_x_global    # No gradients for model and x_local, only for x_global
+
+
 class FNOmat(MaterialBase):
     """
-    Surrogate material model based on DualEncoderFNO for FEINN.
-    Microstructure pool is built in [0, 1]. 
-    The external fhard function must return values in [0, 1].
+    FNO-based surrogate material model for multiscale FE simulations.
+    Evaluates homogenized stress and tangent stiffness efficiently.
     """
     def __init__(self,
                  model: torch.nn.Module,
                  normalizers: Dict[str, object],
-                 microstructure_pool: MicrostructurePool,
-                 fhard: Callable[[torch.Tensor], torch.Tensor],     # coords → fhard ∈ [0, 1]
-                 chunk_size: int = 512,
+                 microstructure_pool: object,
+                 fhard: Callable[[torch.Tensor], torch.Tensor],
+                 chunk_size: int = 48,
                  n_state: int = 3,
                  dtype: torch.dtype = torch.float32,
-                 device: str = 'cpu'):
+                 device: str = 'cuda'):
         
         super().__init__(n_state=n_state, dtype=dtype, device=device)
 
-        self.model = model.eval().to(device, dtype)
-
-        self.x_normalizer = normalizers['x_normalizer']
-        self.global_normalizer = normalizers['global_normalizer']
-        self.y_normalizer = normalizers['y_normalizer']
-
-        self.pool = microstructure_pool
-        self.fhard = fhard
-        self.chunk_size = chunk_size
-
-        # Normalize pool once
-        self.pool_phase_norm = self.x_normalizer.transform(self.pool.pool_phase)
-
-    def init_state(self, nelem: int, ngp: int, coords: torch.Tensor) -> torch.Tensor:
+        self.model = model.to(device).eval()        # evaluation mode, no dropout/batchnorm updates
+        self.model.requires_grad_(False)            # ensure no gradients for model parameters during solver backward pass
         
-        fhard_eval = self.fhard(coords)                                   # debe estar en [0, 1]
+        self.pool = microstructure_pool             # Pre-computed microstructure features for all Gauss points
+        self.fhard = fhard                          # Function to compute fraction of hard phase from microstructure features
+        self.chunk_size = chunk_size                # Number of samples to process per chunk during inference and autograd
 
-        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
-        tags = torch.argmin(diffs, dim=-1)
+        # Intance normalizers
+        self.x_norm = normalizers['x_normalizer'].to(device)
+        self.g_norm = normalizers['global_normalizer'].to(device)
+        self.y_norm = normalizers['y_normalizer'].to(device)
 
-        state = torch.zeros((nelem, ngp, self.n_state), 
-                            dtype=self.dtype, device=self.device)
-        state[..., 0] = tags.to(self.dtype)                               # RVE tag
-        return state
+        # Reshape image normalizers for spatial broadcasting (C, H, W)
+        for norm in [self.x_norm, self.y_norm]:
+            if norm.mean.ndim == 1:
+                norm.mean = norm.mean.view(-1, 1, 1)
+                norm.std = norm.std.view(-1, 1, 1)
 
+        # Pre-normalize microstructure features for all Gauss points and store on device
+        self.pool_phase_norm = self.x_norm.transform(self.pool.pool_phase.to(device))
+        
+        # Output dimensions for reshaping predictions
+        self.out_C = self.y_norm.mean.shape[0]
+        self.out_H = self.pool.pool_phase.shape[2]
+        self.out_W = self.pool.pool_phase.shape[3]
+        
     def update_state(self, strain: torch.Tensor, state_old: torch.Tensor, isTangent: bool = False):
         """
-        Updates the material state using the FNO surrogate model.
-        Returns homogenized stress and updated internal variables (max Von Mises per phase).
+        Updates the material state for the given strain increment.
+        Returns homogenized stress and optionally the tangent stiffness matrix.
         """
-        ddsdde = None
-        if isTangent:
-            raise NotImplementedError("Tangent stiffness not implemented yet for FNOmat.")
-
-        nelem, ngp, _ = strain.shape
-        N = nelem * ngp
-
-        # Extract local microstructures: (N, C, H, W)
-        tags = state_old[..., 0].long()
-        x_local = self.pool_phase_norm[tags.view(-1)]
-        _, _, H, W = x_local.shape
+        nelem, ngp, _ = strain.shape        # (nelem, ngp, 3)
+        N = nelem * ngp                     # Total number of Gauss points across the batch
         
-        # Normalize global macro-strain
-        x_global = strain.reshape(N, 3)
-        x_global = self.global_normalizer.transform(x_global)
+        tags = state_old[..., 0].long()
+        x_local_norm = self.pool_phase_norm[tags.view(-1)]
+        
+        x_global = strain.reshape(N, 3).to(self.dtype)
+        x_global_norm = self.g_norm.transform(x_global)
 
-        # FNO prediction: returns full micromechanical stress field (N, 3, H, W)
-        pred_norm = self._inference_in_chunks(x_local, x_global)
+        # Forward pass and homogenization
+        pred_norm = self._inference_in_chunks(x_local_norm, x_global_norm)       # normalized stress predictions (N, 3, H, W)
+        pred_physical = self.y_norm.inverse_transform(pred_norm)            # physical stress predictions (N, 3, H, W)
+        
+        _, _, H, W = x_local_norm.shape
+        sigma = pred_physical.view(nelem, ngp, 3, H, W)     # reshape to (nelem, ngp, 3, H, W)
+        stress_hom = sigma.mean(dim=(3, 4))                 # homogeneization. shape: (nelem, ngp, 3)
 
-        # Inverse normalization and spatial reshape: (nelem, ngp, 3, H, W)
-        pred_physical = self.y_normalizer.inverse_transform(pred_norm)
-        sigma = pred_physical.view(nelem, ngp, 3, H, W)
+        # Compute tangent stiffness if requested by the solver
+        ddsdde = self._compute_tangent_autograd(x_local_norm, x_global_norm, nelem, ngp) if isTangent else None
 
-        # Homogenization: Spatial average over H (dim=3) and W (dim=4)
-        # Returns macroscopic stress per Gauss point: (nelem, ngp, 3)
-        stress_hom = sigma.mean(dim=(3, 4))
+        return stress_hom, state_old, ddsdde
 
-        # Extract maximum micro-stress per phase
-        vm_soft, vm_hard = self._compute_vm_per_phase(sigma, tags, H, W)
-
-        # Update historical state variables with the new maximums
-        state_new = state_old.clone()
-        state_new[..., 1] = torch.maximum(state_old[..., 1], vm_soft)
-        state_new[..., 2] = torch.maximum(state_old[..., 2], vm_hard)
-
-        return stress_hom, state_new, ddsdde
-
-    def _inference_in_chunks(self, x_local: torch.Tensor, x_global: torch.Tensor) -> torch.Tensor:
+    def _inference_in_chunks(self, x_local_norm: torch.Tensor, x_global_norm: torch.Tensor) -> torch.Tensor:
         """
-        Performs batched inference to prevent GPU Out-Of-Memory (OOM) errors.
-        Returns the full spatial prediction tensor.
+        Performs inference in batches (chunks) to limit peak VRAM consumption.
         """
-        N, _, H, W = x_local.shape
-        pred = torch.zeros((N, 3, H, W), dtype=self.dtype, device=self.device)
-
+        N = x_local_norm.shape[0]
+        output = torch.empty((N, self.out_C, self.out_H, self.out_W), dtype=self.dtype, device=self.device)
+        
         for i in range(0, N, self.chunk_size):
             j = min(i + self.chunk_size, N)
-            with torch.no_grad():
-                pred[i:j] = self.model(x_local[i:j], x_global[i:j])
-                
-        return pred
+            output[i:j] = PartialGradientFNO.apply(self.model, x_local_norm[i:j], x_global_norm[i:j])
+            
+        return output
 
-    def _compute_vm_per_phase(self, sigma: torch.Tensor, tags: torch.Tensor, H: int, W: int):
+    def _compute_tangent_autograd(self, x_local_norm: torch.Tensor, x_global_norm: torch.Tensor, nelem: int, ngp: int):
         """
-        Computes the maximum Von Mises stress for the soft and hard phases
-        by applying spatial masks to the full micro-stress field.
+        Computes the consistent tangent stiffness matrix (Jacobian) using chunked autograd.
+        Applies chain rule scaling to return values in physical units.
         """
-        nelem, ngp, _, _, _ = sigma.shape
-        
-        # Retrieve and reshape masks to match integration points geometry
-        tags_flat = tags.view(-1)
-        mask_soft, mask_hard = self.pool.get_masks(tags_flat)
-        
-        mask_soft = mask_soft.view(nelem, ngp, H, W)
-        mask_hard = mask_hard.view(nelem, ngp, H, W)
+        N = x_local_norm.shape[0]
+        ddsdde_norm = torch.zeros((N, 3, 3), dtype=self.dtype, device=self.device)
 
-        # Extract individual stress components
-        sxx = sigma[:, :, 0, :, :]
-        syy = sigma[:, :, 1, :, :]
-        sxy = sigma[:, :, 2, :, :]
+        # Chain rule factor: d(sigma_phys) / d(epsilon_phys) = d(sigma_phys) / d(epsilon_norm) * (1 / std_epsilon)
+        scale_factor = 1.0 / self.g_norm.std.view(1, 3)
 
-        # Compute the full Von Mises micro-field
-        vm_sq = sxx**2 + syy**2 - sxx*syy + 3 * sxy**2
+        # Force gradient tracking, overriding any global torch.no_grad() from the solver
+        with torch.enable_grad():
+            
+            # Process in chunks to prevent OOM
+            for i in range(0, N, self.chunk_size):
+                j = min(i + self.chunk_size, N)
 
-        # Apply phase masks (zeros out the other phase) and find the spatial maximum
-        vm_sq_soft_max = (vm_sq * mask_soft).amax(dim=(2, 3))
-        vm_sq_hard_max = (vm_sq * mask_hard).amax(dim=(2, 3))
+                chunk_x_l = x_local_norm[i:j]
+                chunk_x_g = x_global_norm[i:j].detach().requires_grad_(True)
 
-        vm_soft_max = torch.sqrt(vm_sq_soft_max)
-        vm_hard_max = torch.sqrt(vm_sq_hard_max)
+                # Single forward pass per chunk; float32 bypasses cuFFT constraints
+                with torch.amp.autocast(device_type='cuda', enabled=False):
+                    pred_norm = self.model(chunk_x_l.to(torch.float32), chunk_x_g.to(torch.float32))
+                    
+                    # Un-normalize directly within the computational graph
+                    pred_physical = self.y_norm.inverse_transform(pred_norm)
+                    stress_hom = pred_physical.mean(dim=(2, 3)) # Shape: (chunk_size, 3)
+                    
+                    base_grad_out = torch.zeros_like(stress_hom)
+                    
+                # Compute Jacobian columns (Voigt notation components)
+                for k in range(3):
+                    base_grad_out[:, k] = 1.0
+                    
+                    grad_k = torch.autograd.grad(
+                        outputs=stress_hom,
+                        inputs=chunk_x_g,
+                        grad_outputs=base_grad_out,
+                        retain_graph=True if k < 2 else False, 
+                        only_inputs=True
+                    )[0]
+                    
+                    base_grad_out[:, k] = 0.0
+                    
+                    ddsdde_norm[i:j, k, :] = grad_k
 
-        return vm_soft_max, vm_hard_max
+        # Scale to physical units, reshape, and enforce mechanical symmetry
+        ddsdde = (ddsdde_norm * scale_factor).view(nelem, ngp, 3, 3)
+        ddsdde = (ddsdde + ddsdde.transpose(-1, -2)) / 2.0
+
+        return ddsdde
