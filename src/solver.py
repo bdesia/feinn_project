@@ -913,7 +913,7 @@ class FEINN(BaseSolver):
     def _set_dtype(self):
         self.dtype = torch.float32
 
-    def warmup_zero_displacement(self, epochs=500, lr=1e-3):
+    def warmup_zero_displacement(self, epochs=1000, lr=1e-3):
         """
         Warmup training to initialize the neural network to output near-zero displacements.
         This helps to start the training from a physically reasonable state.
@@ -1123,7 +1123,7 @@ class FEINN(BaseSolver):
                     print(f" Maximum gradient (Inf-Norm): {max_g:.2e}")
                     
         if self.verbose:
-            print(f"[FEINN] Training complete – final loss: {train_results['Overall']:.3e}")
+            print(f"[FEINN] Training complete.")
         
         with torch.no_grad():
             self.udisp = self.nnet(self.coords_tensor).reshape(-1).detach()
@@ -1135,29 +1135,43 @@ class FEINN(BaseSolver):
         Plot loss history during training.
         """
         import matplotlib.pyplot as plt
+        import torch
 
-        # Check if history exists       
+        # Check if history exists
         if not hasattr(self, 'history') or 'loss' not in self.history:
             raise ValueError("No model has been trained yet. Execute .train() first.")
 
         history = self.history['loss']
 
-        epochs = range(1, len(history['total']) + 1)
+        # Helper to safely convert any tensor (CPU or CUDA) to numpy
+        def to_np(x):
+            if isinstance(x, torch.Tensor):
+                return x.detach().cpu().numpy()   # .item() also works for scalars
+            return x
+
+        # Convert all loss lists
+        total  = [to_np(v) for v in history['total']]
+        domain = [to_np(v) for v in history['domain']]
+        bc     = [to_np(v) for v in history['bc']]
+
+        epochs = range(1, len(total) + 1)
 
         plt.figure(figsize=(10, 6))
 
-        plt.plot(epochs, history['total'], label='Overall Loss', color='black', linewidth=2.5)
-        plt.plot(epochs, history['domain'], label='Domain', linestyle='--', linewidth=2)
-        plt.plot(epochs, history['bc'], label='BoundaryConditions', linestyle='-.', linewidth=2)
-        if self.isData and history['data'] and any(history['data']):
-            plt.plot(epochs, history['data'], label='LabelledData', linestyle=':', linewidth=2)
+        plt.plot(epochs, total, label='Overall Loss', color='black', linewidth=2.5)
+        plt.plot(epochs, domain, label='Domain', linestyle='--', linewidth=2)
+        plt.plot(epochs, bc, label='BoundaryConditions', linestyle='-.', linewidth=2)
+
+        if self.isData and history.get('data') and any(history['data']):
+            data_loss = [to_np(v) for v in history['data']]
+            plt.plot(epochs, data_loss, label='LabelledData', linestyle=':', linewidth=2)
 
         plt.yscale('log')
         plt.xlabel('Epoch')
         plt.ylabel('Loss (log scale)')
         plt.grid(True, which="both", ls="--", alpha=0.5)
         plt.legend()
-        
+
         if title is None:
             title = 'Training History - FEINN'
         plt.title(title)
