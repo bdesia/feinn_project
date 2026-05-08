@@ -63,6 +63,39 @@ class MicrostructurePool:
         idx = tags.view(-1).long()
         return self.pool_mask_soft[idx], self.pool_mask_hard[idx]
 
+    def plot(self, indices: Optional[torch.Tensor] = None, max_cols: int = 5) -> None:
+        """
+        Plot a grid of microstructures from the pool.
+
+        Args:
+            indices: Optional 1-D tensor of bin indices to display. Defaults to all bins.
+            max_cols: Maximum number of columns in the grid.
+        """
+        if indices is None:
+            indices = torch.arange(self.num_bins)
+        indices = indices.long().cpu()
+        n = len(indices)
+
+        ncols = min(n, max_cols)
+        nrows = (n + ncols - 1) // ncols
+
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
+        axes = np.array(axes).reshape(-1)  # flatten for uniform indexing
+
+        for k, idx in enumerate(indices):
+            phase_np = self.pool_phase[idx].squeeze(0).cpu().numpy()
+            fval = self.fhard_bins[idx].item()
+            axes[k].imshow(phase_np, cmap='viridis', origin='lower', vmin=0, vmax=1)
+            axes[k].set_title(f"bin {idx.item()}\nfhard={fval:.3f}", fontsize=8)
+            axes[k].set_axis_off()
+
+        for k in range(n, len(axes)):
+            axes[k].set_visible(False)
+
+        plt.suptitle("MicrostructurePool", fontsize=11, y=1.01)
+        plt.tight_layout()
+        plt.show()
+
 class MicrostructureGenerator(ABC):
     """
     Abstract base class for RVE microstructure generators.
