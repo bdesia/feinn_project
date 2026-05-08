@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from abc import ABC, abstractmethod
-from typing import Tuple
+from typing import Tuple, Optional
 
 class MicrostructurePool:
     """
@@ -13,6 +13,9 @@ class MicrostructurePool:
     def __init__(self,
                  generator: object,
                  fhard_bins: torch.Tensor,
+                 meshing: bool = False,
+                 delta_x: Optional[float] = 0.10,
+                 delta_y: Optional[float] = 0.10,
                  device: str = 'cpu',
                  dtype: torch.dtype = torch.float64):
         
@@ -26,7 +29,9 @@ class MicrostructurePool:
         pool_phase = []
         pool_mask_soft = []
         pool_mask_hard = []
-
+        if meshing:
+            pool_mesh = []
+            
         for i, f in enumerate(self.fhard_bins):
             phase, mask_soft, mask_hard = generator.generate(
                 f.item(), device=device, dtype=dtype
@@ -35,14 +40,17 @@ class MicrostructurePool:
             pool_phase.append(phase)
             pool_mask_soft.append(mask_soft)
             pool_mask_hard.append(mask_hard)
-
+            if meshing:
+                pool_mesh.append(generator.to_mesh(lx=delta_x, ly=delta_y))
+                
             if (i + 1) % 5 == 0 or i == self.num_bins - 1:
                 print(f"   → {i+1:2d}/{self.num_bins} microstructures generated")
 
         self.pool_phase = torch.stack(pool_phase)      # (num_bins, C, H, W) raw
         self.pool_mask_soft = torch.stack(pool_mask_soft)
         self.pool_mask_hard = torch.stack(pool_mask_hard)
-
+        self.pool_mesh = torch.stack(pool_mesh)
+        
         print(f"MicrostructurePool ready | Shape: {self.pool_phase.shape}")
 
     def get_rves(self, tags: torch.Tensor) -> torch.Tensor:
@@ -298,9 +306,6 @@ class RandomBlocks(MicrostructureGenerator):
         
         return self.phase_tensor, self.mask_soft, self.mask_hard
     
-import torch
-from typing import Tuple
-
 class Layered(MicrostructureGenerator):
     """
     Generates a layered (striped) microstructure with controllable orientation and frequency.
