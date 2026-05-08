@@ -49,7 +49,8 @@ class MicrostructurePool:
         self.pool_phase = torch.stack(pool_phase)      # (num_bins, C, H, W) raw
         self.pool_mask_soft = torch.stack(pool_mask_soft)
         self.pool_mask_hard = torch.stack(pool_mask_hard)
-        self.pool_mesh = torch.stack(pool_mesh)
+        if meshing:
+            self.pool_mesh = torch.stack(pool_mesh)
         
         print(f"MicrostructurePool ready | Shape: {self.pool_phase.shape}")
 
