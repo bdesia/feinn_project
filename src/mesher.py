@@ -141,6 +141,7 @@ class Mesh2D:
         Returns:
             matplotlib.axes.Axes: The axes object used for plotting.
         """
+        fig = None
         if ax is None:
             fig, ax = plt.subplots()
         
@@ -223,9 +224,24 @@ class Mesh2D:
         ax.set_xlabel('X')
         ax.set_ylabel('Y')
         ax.set_title('2D Finite Element Mesh')
-        # ax.grid(True)
-        ax.legend()
-        ax.set_aspect('equal')  # Ensure equal scaling for x and y axes
+
+        # Place legend outside the domain so it does not overlap the mesh
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(
+                handles=handles, labels=labels,
+                loc='upper left',
+                bbox_to_anchor=(1.02, 1),
+                borderaxespad=0,
+                frameon=True,
+                fancybox=False,
+                edgecolor='gray',
+                fontsize=10,
+            )
+            if fig is not None:
+                plt.tight_layout()
+
+        ax.set_aspect('equal')
         return
 
     @classmethod
