@@ -4,6 +4,7 @@ import torch.nn as nn
 from dataclasses import dataclass
 from batch_elements import LineElement, QuadElement
 from conditions import *
+from typing import Optional
 
 # ----------------------------------------------------------------------
 # Solver classes
@@ -714,11 +715,19 @@ class BaseSolver:
             title = f"Field on Gauss points"
         ax.set_title(title, fontsize=16, pad=20)
 
-        # Colorbar
-        cbar = fig.colorbar(coll, ax=ax, shrink=0.75, pad=0.03)
+        # Colorbar orientation — horizontal for landscape meshes, vertical for portrait
+        lx = coords[:, 0].max() - coords[:, 0].min()
+        ly = coords[:, 1].max() - coords[:, 1].min()
+        if lx > ly:
+            cbar = fig.colorbar(coll, ax=ax, orientation='horizontal',
+                                shrink=0.7, pad=0.05)
+            plt.subplots_adjust(left=0.02, right=0.98, top=0.94, bottom=0.12)
+        else:
+            cbar = fig.colorbar(coll, ax=ax, orientation='vertical',
+                                shrink=0.75, pad=0.03)
+            plt.subplots_adjust(left=0.01, right=0.79, top=0.94, bottom=0.06)
         cbar.set_label('Value')
 
-        plt.subplots_adjust(left=0.01, right=0.79, top=0.94, bottom=0.06)
         plt.show()
 
 class NFEA(BaseSolver):
@@ -961,6 +970,7 @@ class FEINN(BaseSolver):
                  nnet: nn.Module = None,
                  nnet_init: str = None,
                  isData: bool = False,
+                 bc_type: Optional[str] = 'soft',       # Must be 'soft' or 'hard'
                  bc_weight: float = 1e4,                # Penalty weight for soft BCs
                  normalize_coords = True,
                  ):
@@ -969,7 +979,11 @@ class FEINN(BaseSolver):
                          body_loads, edge_loads, line_loads, nodal_loads, mpcs,
                          formulation, device, verbose)
         
+        if bc_type not in ('soft', 'hard'):
+            raise ValueError(f"bc_type must be 'soft' or 'hard', got '{bc_type}'")
+
         self.isData = isData
+        self.bc_type = bc_type
         self.bc_weight = bc_weight
         
         # Neural network
@@ -989,11 +1003,12 @@ class FEINN(BaseSolver):
         # Nodal coordinates
         if normalize_coords:
             self._normalize_coords()
-        
+
         if self.verbose:
             n_params = sum(p.numel() for p in self.nnet.parameters())
             print(f"[FEINN] Initialized with {n_params} trainable parameters")
-            print(f"[FEINN] Soft Dirichlet BC enforcement (weight = {self.bc_weight:.1e})")
+            print(f"[FEINN] BC enforcement: {self.bc_type.upper()}"
+          + (f" (weight={self.bc_weight:.1e})" if self.bc_type == 'soft' else " (exact)"))
 
         self.loss_fun = nn.MSELoss()
         res0 = self.Fext_total[self.free_dofs]
@@ -1002,14 +1017,17 @@ class FEINN(BaseSolver):
             self.loss_res0 = 1.0
 
         # === BC preprocessing ===
-        bc_data = self._get_dirichlet_bc_data()
-        if bc_data:
-            # Pre-calculamos todo lo necesario para no hacer loops luego
-            self._bc_nodes = torch.cat([bc['nodes_0'] for bc in bc_data])
-            self._bc_dofs_idx = torch.cat([bc['dofs'] % 2 for bc in bc_data]) # 0 para ux, 1 para uy
-            self._bc_values = torch.cat([bc['values'] for bc in bc_data])
-        else:
-            self._bc_nodes = None
+        self._build_hard_bc_tensors()
+
+        if self.bc_type == 'soft':
+            bc_data = self._get_dirichlet_bc_data()
+            if bc_data:
+                # Pre-compute
+                self._bc_nodes = torch.cat([bc['nodes_0']       for bc in bc_data])
+                self._bc_dofs_idx = torch.cat([bc['dofs'] % 2   for bc in bc_data]) # 0 para ux, 1 para uy
+                self._bc_values = torch.cat([bc['values']       for bc in bc_data])
+            else:
+                self._bc_nodes = None
 
         # === SET L-BFGS OPTIMIZER ===
         self.lbfgs_optimizer = torch.optim.LBFGS(
@@ -1031,6 +1049,53 @@ class FEINN(BaseSolver):
     def _set_dtype(self):
         self.dtype = torch.float32
 
+    def _build_hard_bc_tensors(self) -> None:
+        """
+        Pre-computes the mask φ and the lift u_Γ for hard BC enforcement.
+
+        For each node i and component d (0=ux, 1=uy):
+            φ[i, d] = 0  →  DOF is prescribed (NN contribution zeroed out)
+            φ[i, d] = 1  →  DOF is free       (NN output passes through)
+
+        Hard BC transform:
+            u_hard = φ * u_NN + u_Γ
+        """
+        # φ = 1 everywhere by default (all free)
+        phi   = torch.ones (self.nnod, 2, dtype=self.dtype, device=self.device)
+        u_gam = torch.zeros(self.nnod, 2, dtype=self.dtype, device=self.device)
+
+        bc_data = self._get_dirichlet_bc_data()
+        for bc in bc_data:
+            nodes   = bc['nodes_0']       # (n,)  0-based node indices
+            dof_idx = bc['dofs'] % 2      # (n,)  0 = ux,  1 = uy
+            values  = bc['values']        # (n,)  prescribed displacement
+
+            phi  [nodes, dof_idx] = 0.0
+            u_gam[nodes, dof_idx] = values
+
+        # Register as non-trainable buffers (move correctly with .to(device))
+        self._hard_phi   = phi    # (nnod, 2)
+        self._hard_u_gam = u_gam  # (nnod, 2)
+
+        if self.verbose:
+            n_fixed = int((phi == 0).sum().item())
+            print(f"[FEINN] Hard BCs built → {n_fixed} fixed DOFs")
+
+    def _apply_hard_bc(self, u_raw: torch.Tensor) -> torch.Tensor:
+        """
+        Project raw NN output onto the constraint manifold.
+
+        Parameters
+        ----------
+        u_raw : (nnod, 2)  raw network output
+
+        Returns
+        -------
+        u_hard : (nnod, 2)  with Dirichlet BCs exactly satisfied
+        """
+        return self._hard_phi * u_raw + self._hard_u_gam
+
+
     def warmup_zero_displacement(self, epochs=1000, lr=1e-3):
         """
         Warmup training to initialize the neural network to output near-zero displacements.
@@ -1038,18 +1103,29 @@ class FEINN(BaseSolver):
         """
         optimizer = torch.optim.Adam(self.nnet.parameters(), lr=lr)
         X = self.coords_tensor
-        
         self.nnet.train()
-        for epoch in range(epochs):
-            optimizer.zero_grad()
-            u_pred = self.nnet(X)
-            loss_zero = self.loss_fun(u_pred, torch.zeros_like(u_pred))
-            loss_zero.backward()
-            optimizer.step()
-            
-        print(f"Warmup loss: {loss_zero.item():.2e}")
-        print("[FEINN] Warmup completado - salida inicial ≈ 0")
 
+        if self.bc_type == 'hard':
+            # Target: free nodes must be ≈ 0
+            # u_hard = φ * u_NN + u_Γ → we seek for φ * u_NN ≈ 0
+            target = self._hard_u_gam                       # (nnod, 2)
+            for _ in range(epochs):
+                optimizer.zero_grad()
+                u_hard = self._apply_hard_bc(self.nnet(X))
+                loss = self.loss_fun(u_hard, target)
+                loss.backward()
+                optimizer.step()
+        else:
+            # Soft: whole output ≈ 0
+            target = torch.zeros(self.nnod, 2, dtype=self.dtype, device=self.device)
+            for _ in range(epochs):
+                optimizer.zero_grad()
+                loss = self.loss_fun(self.nnet(X), target)
+                loss.backward()
+                optimizer.step()
+
+        print(f"[FEINN] Warmup ({self.bc_type}) loss: {loss.item():.2e}")
+        
     @staticmethod
     def init_xavier(m):
         if isinstance(m, nn.Linear):
@@ -1078,22 +1154,27 @@ class FEINN(BaseSolver):
         return self.Fext_total - Fint                 
 
     def _compute_total_loss(self, model: nn.Module) -> torch.Tensor:
-        
-        # Domain loss
-        X_domain = self.coords_tensor
-        u_pred = model(X_domain)
 
-        res_pred = self._forces_residual(u_pred.reshape(-1))[self.free_dofs]
+        X_domain = self.coords_tensor
+        u_raw = model(X_domain)
+        
+        # BC enforcement
+        if self.bc_type == 'hard':
+            u_eval = self._apply_hard_bc(u_raw)     # hard BCs
+        else:
+            u_eval = u_raw                          #  Unmodified net
+            
+        # Domain loss
+        res_pred = self._forces_residual(u_eval.reshape(-1))[self.free_dofs]
         res_true = torch.zeros_like(res_pred)
         loss_domain = self.loss_fun(res_pred, res_true) / self.loss_res0
 
-        # BC loss   
+        # BC loss
         loss_bc = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        if self._bc_nodes is not None:
-            u_pred_bc_all = u_pred[self._bc_nodes]  # Takes predictions from "u_pred" for the whole domain (n_bc_nodes, 2)
-            u_pred_bc = u_pred_bc_all[torch.arange(len(self._bc_nodes)), self._bc_dofs_idx]
-            
-            loss_bc = self.bc_weight * self.loss_fun(u_pred_bc, self._bc_values)
+        
+        if self.bc_type == 'soft' and self._bc_nodes is not None:
+            u_bc = u_raw[self._bc_nodes, self._bc_dofs_idx]
+            loss_bc = self.bc_weight * self.loss_fun(u_bc, self._bc_values)
 
         # Data loss
         loss_data = torch.tensor(0.0, device=self.device, dtype=self.dtype)
