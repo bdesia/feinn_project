@@ -1,5 +1,6 @@
 # Environmental variables
 .env
+.claude
 
 # Virtual environments
 .venv
