@@ -108,6 +108,7 @@ class RVEDataset(Dataset):
                 self.x_local_data = self.x_local_data.permute(0, 3, 1, 2).contiguous()
                 self.y_local_data = self.y_local_data.permute(0, 3, 1, 2).contiguous()
 
+                # =====================================================
                 if self.normalize and not self.augment:
                     # Vectorized operations: Transform the entire dataset at once (C++ backend)
                     self.x_local_data = self.x_normalizer.transform(self.x_local_data)
@@ -433,14 +434,14 @@ class DualEncoderFNO(nn.Module):
         B, _, H, W = x_local.shape
         max_modes = min(H, W) // 2
         
-        if self.n_modes > max_modes:
+        if self.training and self.n_modes > max_modes:
             raise ValueError(
                 f"Number of modes (n_modes={self.n_modes}) exceeds the Nyquist frequency "
                 f"for the input resolution {H}x{W}. "
                 f"n_modes must be <= {max_modes}."
             )
 
-        if self.use_positional_grid and self.use_sinusoidal_emb and self.sin_emb_maxfreq > max_modes:
+        if self.training and self.use_positional_grid and self.use_sinusoidal_emb and self.sin_emb_maxfreq > max_modes:
             max_allowed_nfreq = int(log2(max_modes)) + 1
             raise ValueError(
                 f"Maximum sinusoidal embedding frequency (sin_emb_maxfreq={self.sin_emb_maxfreq}) exceeds the Nyquist frequency "
@@ -859,6 +860,9 @@ class RVEInferencer:
         # Forward pass
         pred_norm = self.model(x_local, x_global)
         
+        # Permute to (B, 96, 96, 3)
+        pred_norm = pred_norm.permute(0, 2, 3, 1).contiguous()
+        
         # Invert normalization to return to the physical stress scale
         if self.y_normalizer is not None:
             pred_physical = self.y_normalizer.inverse_transform(pred_norm)
@@ -922,7 +926,6 @@ class RVEVisualizer:
         tt = y_true[index]  # FEM
         zz = y_pred[index]  # FNO
         
-        # INVERTIMOS LA FASE AQUÍ (1 - fase)
         ph = 1.0 - phase[index].squeeze() 
         
         # Get grid size
@@ -934,14 +937,14 @@ class RVEVisualizer:
 
         # --- Extract Lines ---
         # Horizontal lines (varying X, constant Y = hline)
-        hor_true = [tt[:, hline, i] for i in range(3)]
-        hor_pred = [zz[:, hline, i] for i in range(3)]
-        hor_phase = ph[:, hline]
+        hor_true = [tt[hline - 1, :, i] for i in range(3)]
+        hor_pred = [zz[hline - 1, :, i] for i in range(3)]
+        hor_phase = ph[hline - 1, :]
 
         # Vertical lines (varying Y, constant X = vline)
-        ver_true = [tt[vline, :, i] for i in range(3)]
-        ver_pred = [zz[vline, :, i] for i in range(3)]
-        ver_phase = ph[vline, :]
+        ver_true = [tt[:, vline - 1, i] for i in range(3)]
+        ver_pred = [zz[:, vline - 1, i] for i in range(3)]
+        ver_phase = ph[:, vline - 1]
 
         # Create 2x3 grid
         fig, ax = plt.subplots(2, 3, figsize=(21, 10))
@@ -1025,68 +1028,62 @@ class RVEVisualizer:
         plt.show()
     
     @staticmethod
-    def plot_contours(phase, y_true, y_pred, index, channel=0, xcor=None, ycor=None, cmap='viridis', title= None):
+    def plot_contours(phase, y_true, y_pred, index, channel=0, cmap='viridis', title=None):
         """
-        Plots a 1x3 grid comparing the input phase, ground truth, and model prediction.
+        Plots a 1x3 grid comparing input phase, FEM ground truth, and model prediction
 
         Args:
             phase (ndarray): Input phase data (batch_size, H, W, ...).
             y_true (ndarray): Ground truth tensor (batch_size, H, W, num_components).
             y_pred (ndarray): Predicted tensor (batch_size, H, W, num_components).
             index (int): Index of the sample to visualize.
-            channel (int): Channel to plot (0-based index). Defaults to 0.
-            xcor (ndarray, optional): X-coordinates grid. Defaults to None.
-            ycor (ndarray, optional): Y-coordinates grid. Defaults to None.
-            cmap (str): Colormap for the output fields. Defaults to 'viridis'.
+            channel (int): Channel to plot (0-based index).
+            cmap (str): Colormap for the output fields.
         """
-        # Convert to 0-based index (e.g., Component 1 -> index 0)
-        c_idx = channel 
+        c_idx = channel
         
-        # Generate coordinates if not provided
-        if xcor is None or ycor is None:
-            L_x, L_y = y_true[index].shape[0], y_true[index].shape[1]
-            xcor, ycor = np.meshgrid(np.arange(L_x), np.arange(L_y), indexing='ij')
+        # Extract data for the specific index and channel
+        # Expected shape: (H, W)
+        data_phase = phase[index].squeeze()
+        data_true = y_true[index][:, :, c_idx]
+        data_pred = y_pred[index][:, :, c_idx]
 
         fig, ax = plt.subplots(1, 3, figsize=(12, 4))
         
-        # Min/max bounds for the selected component (Ground Truth & Prediction)
-        comb = [y_pred[index][:, :, c_idx], y_true[index][:, :, c_idx]]
-        _min, _max = np.min(comb), np.max(comb)
+        # Unified normalization for FEM and Prediction
+        _min, _max = np.min([data_true, data_pred]), np.max([data_true, data_pred])
 
-        # Left: Input Phase
-        ax[0].pcolormesh(xcor, ycor, phase[index].squeeze(), cmap='gray', shading='auto')
+        # Visualization using imshow with origin='lower' to match Cartesian coordinates
+        # extent handles the physical scaling [x_min, x_max, y_min, y_max]
+        h, w = data_true.shape
+        ext = [0, w, 0, h]
+
+        ax[0].imshow(data_phase, cmap='gray', origin='lower', extent=ext)
         ax[0].set_title('Phase map', fontsize=12)
 
-        # Center: Ground Truth (FEM)
-        ax[1].pcolormesh(xcor, ycor, y_true[index][:, :, c_idx], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
-        ax[1].set_title(f'FEM', fontsize=12)
+        ax[1].imshow(data_true, cmap=cmap, vmin=_min, vmax=_max, origin='lower', extent=ext)
+        ax[1].set_title('FEM', fontsize=12)
 
-        # Right: Prediction (DualEncoderFNO)
-        pcm_pred = ax[2].pcolormesh(xcor, ycor, y_pred[index][:, :, c_idx], cmap=cmap, vmin=_min, vmax=_max, shading='auto')
-        ax[2].set_title(f'DualEncoderFNO', fontsize=12)
+        im_pred = ax[2].imshow(data_pred, cmap=cmap, vmin=_min, vmax=_max, origin='lower', extent=ext)
+        ax[2].set_title('DualEncoderFNO', fontsize=12)
 
-        # Global formatting
-        for i in range(3):
-            ax[i].set_yticklabels([])
-            ax[i].set_xticklabels([])
-            ax[i].xaxis.set_tick_params(width=0)
-            ax[i].yaxis.set_tick_params(width=0)
-            ax[i].set_aspect('equal')
-            for spine in ax[i].spines.values():
+        # Formatting
+        for a in ax:
+            a.set_xticks([])
+            a.set_yticks([])
+            a.set_aspect('equal')
+            for spine in a.spines.values():
                 spine.set_linewidth(1)
 
-        # Global colorbar for Center and Right plots
         plt.tight_layout()
-        fig.subplots_adjust(right=0.9) 
-        cax = fig.add_axes([0.92, 0.15, 0.02, 0.7]) 
-        colorbar = plt.colorbar(pcm_pred, cax=cax)
-        colorbar.ax.tick_params(labelsize=12) 
-        colorbar.outline.set_linewidth(1)
-        colorbar.set_label('[MPa]', fontsize=12)
+        fig.subplots_adjust(right=0.88) 
+        cax = fig.add_axes([0.91, 0.15, 0.02, 0.7]) 
+        cb = fig.colorbar(im_pred, cax=cax)
+        cb.set_label('[MPa]', fontsize=12)
 
         if title is None:
-            title = f'FNO predictions - Channel {channel}'
-        fig.suptitle(title, y=1.1)
+            title = f'DualEncoderFNO predictions - Channel {channel}'
+        fig.suptitle(title, y=1.05)
         plt.show()
 
 class EquilibriumLoss(object):
@@ -1164,24 +1161,37 @@ class HomogenizedLoss(object):
             return self.loss(pred_hom, targ_hom) 
 
 class WeightedVoigtLoss(nn.Module):
-    '''Wrapper for physically consistent loss calculation 
-    on symmetric tensors in Voigt notation.'''
-    
     def __init__(self, base_loss: Callable):
         super().__init__()
-        
         self.base_loss = base_loss
         weights = [1.0, 1.0, 2.0**0.5]
+        # Create as buffer and let PyTorch handle device
         self.register_buffer('weights', torch.tensor(weights, dtype=torch.float32))
     
     def forward(self, prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """
-        Computes the weighted loss.
-        Supports inputs of shape (Batch, Channels, ...) such as (B, C), (B, C, H, W).
-        """
-        # Dynamic broadcasting for different tensor ranks
+        # Ensure weights are on the same device as prediction (safe + cheap)
+        w = self.weights.to(prediction.device)
+        
+        # Dynamic broadcasting
         shape = [1] * prediction.dim()
-        shape[1] = self.weights.shape[0]
-        w = self.weights.view(*shape)
+        shape[1] = len(w)          # more readable
+        w = w.view(*shape)
         
         return self.base_loss(prediction * w, target * w)
+
+def load_trained_model(checkpoint_dir: str = "../checkpoints", model_name_prefix: str = "rve_fno"):
+    
+    path = Path(checkpoint_dir)
+    
+    # Load and instance model
+    config = torch.load(path / f"{model_name_prefix}_config.pth", weights_only=False)
+    model = DualEncoderFNO(**config)
+    
+    # Load Weights and Bias
+    checkpoint = torch.load(path / f"{model_name_prefix}_params.pth")
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load normalizers
+    normalizers = torch.load(path / f"{model_name_prefix}_normalizers.pth", weights_only=False)
+    
+    return model, normalizers
