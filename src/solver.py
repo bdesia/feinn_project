@@ -602,6 +602,124 @@ class BaseSolver:
         plt.subplots_adjust(left=0.01, right=0.80, top=0.94, bottom=0.06)
         plt.show()
 
+    def plot_field(self, 
+                gauss_values, 
+                show_original_mesh: bool = True, 
+                show_nodes: bool = True,
+                original_alpha: float = 0.3,
+                cmap: str = 'viridis',
+                title: str = None,
+                figsize: tuple = (11, 9),
+                vmin: float = None,
+                vmax: float = None):
+        """
+        Plot field on Gauss Points.
+        Only implemented for quad elements.
+        
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import PolyCollection
+        from matplotlib.lines import Line2D
+
+        fig, ax = plt.subplots(figsize=figsize)
+
+        # Original coords
+        coords = self.mesh.coordinates.copy()                   # (nnodes, 2)
+
+        # Prepare values
+        if hasattr(gauss_values, 'detach'):
+            gauss_values = gauss_values.detach().cpu().numpy()
+        if gauss_values.ndim == 3:
+            gauss_values = gauss_values.squeeze(-1)            # (nelem, ngauss)
+
+        # Only quad elements
+        batch = self.quad_batches['all']
+        elem_nodes = batch.nodes.cpu().numpy() - 1            # (nelem, nnodes_per_elem)
+        edge_order = batch.edge_order
+        nelem = batch.nelem
+
+        ngauss = gauss_values.shape[1]
+        ngp = int(np.sqrt(ngauss))
+        if ngp * ngp != ngauss:
+            raise ValueError("gauss_values must have ngauss = ngp² points per element")
+
+        # Uniform divide element
+        ref_lines = np.linspace(-1.0, 1.0, ngp + 1)
+
+        polygons = []
+        colors = []
+
+        for elem in range(nelem):
+            
+            map_order = edge_order[:4] if len(edge_order) > 4 else edge_order
+            idx_map = elem_nodes[elem][map_order]
+            elem_orig = coords[idx_map]
+
+            elem_vals = gauss_values[elem]                     # (ngp²,)
+
+            k = 0
+            for i in range(ngp):        # row "r"
+                for j in range(ngp):    # column "s"
+                    # Corners
+                    r0, r1 = ref_lines[i], ref_lines[i + 1]
+                    s0, s1 = ref_lines[j], ref_lines[j + 1]
+
+                    rs_corners = np.array([
+                        [r0, s0], [r1, s0],
+                        [r1, s1], [r0, s1]
+                    ])
+
+                    # Isoparametric mapping
+                    poly_pts = []
+                    for r, s in rs_corners:
+                        N = 0.25 * np.array([
+                            (1 - r) * (1 - s),
+                            (1 + r) * (1 - s),
+                            (1 + r) * (1 + s),
+                            (1 - r) * (1 + s)
+                        ])
+                        xy = N @ elem_orig
+                        poly_pts.append(xy)
+                    
+                    polygons.append(poly_pts)
+                    colors.append(elem_vals[k])
+                    k += 1
+
+        # PolyCollection
+        coll = PolyCollection(
+            polygons,
+            array=np.array(colors),
+            cmap=cmap,
+            edgecolors='black',
+            linewidths=0.6,
+            alpha=0.92
+        )
+        if vmin is not None or vmax is not None:
+            coll.set_clim(vmin, vmax)
+
+        ax.add_collection(coll)
+
+        if show_original_mesh:
+            for elem in range(nelem):
+                idx = elem_nodes[elem][edge_order]
+                Xo, Yo = coords[idx, 0], coords[idx, 1]
+                ax.plot(Xo, Yo, color='gray', lw=0.9, ls='--', alpha=original_alpha)
+
+        if show_nodes:
+            ax.scatter(coords[:, 0], coords[:, 1], c='#1f77b4', s=12, zorder=5)
+
+        ax.set_aspect('equal')
+        ax.axis('off')
+        if title is None:
+            title = f"Field on Gauss points"
+        ax.set_title(title, fontsize=16, pad=20)
+
+        # Colorbar
+        cbar = fig.colorbar(coll, ax=ax, shrink=0.75, pad=0.03)
+        cbar.set_label('Value')
+
+        plt.subplots_adjust(left=0.01, right=0.79, top=0.94, bottom=0.06)
+        plt.show()
 
 class NFEA(BaseSolver):
     """
