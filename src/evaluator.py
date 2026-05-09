@@ -1,147 +1,236 @@
 import numpy as np
+import pandas as pd
 import torch
-from sklearn.metrics import r2_score, mean_absolute_error
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
-from scipy.interpolate import griddata
+from matplotlib.tri import Triangulation
 
 class SolutionComparator:
     """
-    Class to compare two solutions from different methods on the same finite element mesh.
-    
-    Attributes:
-        mesh: Mesh object with coordinates, elements, nnod.
-        y_true (ndarray): 1D array with ground truth solution values at nodes.
-        y_pred (ndarray): 1D array with predicted solution values at nodes.
-        local_errors (dict): Local errors for plotting (difference, absolute error, percentage error).
+    Generalized comparator for N-component solutions (e.g., displacements, stresses)
+    on a 2D finite element mesh.
+    Expects interleaved vectors: [c1_0, c2_0, ..., cN_0, c1_1, c2_1, ...].
     """
     
-    def __init__(self, mesh, y_true, y_pred):
+    def __init__(self, mesh, u_true, u_pred, labels=['ux', 'uy']):
         """
-        Initialize with mesh and solutions. Validates sizes.
+        Initialize with mesh, full solution vectors, and component labels.
         """
         self.mesh = mesh
-        self.y_true = _to_numpy(y_pred)
-        self.y_pred = _to_numpy(y_true)
-
-        # Validate sizes
-        if self.y_true.shape != self.y_pred.shape:
-            raise ValueError("Reference and comparison solutions must have the same size.")
-        if self.y_true.shape[0] != self.mesh.nnod:
-            raise ValueError("Solution sizes do not match number of nodes in mesh.")
+        self.labels = labels
+        self.n_comp = len(labels)
         
-        # Compute local errors for plotting
-        self.local_errors = {
-            'difference': self.y_pred - self.y_true,
-            'absolute_error': np.abs(self.y_pred - self.y_true),
-            'percentage_error': np.where(self.y_true != 0, 
-                                         100 * np.abs((self.y_pred - self.y_true) / self.y_true), 
-                                         0)  # Avoid division by zero
-        }
-    
+        u_t = self._to_numpy(u_true).squeeze()
+        u_p = self._to_numpy(u_pred).squeeze()
+
+        # Validate input dimensions
+        if u_t.shape != u_p.shape:
+            raise ValueError("True and Pred vectors must have the same size.")
+        if u_t.shape[0] != self.mesh.nnod * self.n_comp:
+            raise ValueError(f"Vector size ({u_t.shape[0]}) doesn't match nnod * {self.n_comp} components.")
+
+        self.tol = 1e-6
+        self.comp_data = {}
+
+        # Dynamically slice and store each component
+        for i, label in enumerate(self.labels):
+            y_t = u_t[i::self.n_comp]
+            y_p = u_p[i::self.n_comp]
+            
+            # Precompute local error arrays for each component
+            mask = np.abs(y_t) > self.tol
+            perc_err = np.zeros_like(y_t)
+            perc_err[mask] = 100 * np.abs((y_p[mask] - y_t[mask]) / y_t[mask])
+            
+            self.comp_data[label] = {
+                'true': y_t,
+                'pred': y_p,
+                'errors': {
+                    'difference': y_p - y_t,
+                    'absolute_error': np.abs(y_p - y_t),
+                    'percentage_error': perc_err
+                }
+            }
+
+    @staticmethod
     def _to_numpy(data):
+        """Converts potential PyTorch tensors to numpy arrays."""
         if torch.is_tensor(data):
             return data.detach().cpu().numpy()
         return np.array(data)
-    
-    def compute_r2(self):
-        """Compute R² score."""
-        return r2_score(self.y_true, self.y_pred)
-    
-    def compute_mae(self):
-        """Compute Mean Absolute Error (MAE)."""
-        return mean_absolute_error(self.y_true, self.y_pred)
-    
-    def compute_mape(self):
-        """Compute Mean Absolute Percentage Error (MAPE), ignoring zeros in reference solution."""
-        mask = self.y_true != 0
-        if not np.any(mask):
-            raise ValueError("All reference solution values are zero; MAPE cannot be computed.")
-        return 100 * np.mean(np.abs((self.y_pred[mask] - self.y_true[mask]) / self.y_true[mask]))
-    
-    def compute_rmse(self):
-        """Compute Root Mean Square Error (RMSE)."""
-        return np.sqrt(np.mean((self.y_pred - self.y_true)**2))
-    
-    def _create_grid_and_interpolate(self, values):
-        """Helper to create grid and interpolate values."""
-        points = self.mesh.coordinates
-        x = points[:, 0]
-        y = points[:, 1]
+
+    def _create_trimesh(self):
+        """
+        Creates a Matplotlib Triangulation object. 
+        Converts 1-based element connectivity to 0-based indexing.
+        """
+        pos = self.mesh.coordinates
+        triangles = []
         
-        grid_x, grid_y = np.mgrid[
-            x.min():x.max():100j,
-            y.min():y.max():100j
-        ]
+        if 'quad' in self.mesh.elements:
+            for e in self.mesh.elements['quad']:
+                v = np.array(e) - 1
+                # Split quad into two triangles
+                triangles.extend([[v[0], v[1], v[2]], [v[2], v[3], v[0]]])
+                
+        if 'tri' in self.mesh.elements:
+            for e in self.mesh.elements['tri']:
+                triangles.append([e[0]-1, e[1]-1, e[2]-1])
+                
+        return Triangulation(pos[:, 0], pos[:, 1], triangles)
+
+    def _contour_plot(self, ax, val, title, cmap, levels, vmin, vmax, cbar, row_label=None):
+        """Internal helper to plot a single 2D contour."""
+        tri = self._create_trimesh()
+        cnt = ax.tricontourf(tri, val, cmap=cmap, levels=levels, vmin=vmin, vmax=vmax)
         
-        grid_z = griddata(points, values, (grid_x, grid_y), method='linear')
-        
-        return grid_x, grid_y, grid_z
-    
-    def _contour_plot(self, ax, values, label, cmap, levels):
-        """Helper to plot contour on given ax."""
-        grid_x, grid_y, grid_z = self._create_grid_and_interpolate(values)
-        
-        contour = ax.contourf(grid_x, grid_y, grid_z, levels=levels, cmap=cmap)
-        fig = ax.get_figure()
-        fig.colorbar(contour, ax=ax, label=label)
-        
+        if cbar: 
+            plt.colorbar(cnt, ax=ax)
+            
+        if title: 
+            ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+            
+        # Display row label on the leftmost column, hide y-ticks for others
+        if row_label:
+            ax.set_ylabel(row_label, fontsize=16, fontweight='bold', labelpad=15)
+        else:
+            ax.set_yticks([]) 
+            
         ax.set_xlabel('X')
-        ax.set_ylabel('Y')
-        ax.set_title(label)
         ax.set_aspect('equal')
-    
-    def plot(self, metric='absolute_error', title=None, cmap='viridis', levels=50):
+        return cnt
+
+    def plot_comparison(self, metric='difference', cmap='viridis', levels=50):
         """
-        Plot 2D contour of point-wise metric on the mesh.
-        
-        Args:
-            metric (str): 'difference', 'absolute_error', or 'percentage_error'.
-            title (str, optional): Plot title.
-            cmap (str): Matplotlib colormap (default: 'viridis').
-            levels (int): Number of contour levels (default: 50).
+        Plots a clean grid layout: rows for components, columns for GT, Pred, and Metric.
         """
-        if metric not in self.local_errors:
-            raise ValueError(f"Metric '{metric}' not available. Options: {list(self.local_errors.keys())}")
+        fig, axs = plt.subplots(self.n_comp, 3, figsize=(15, 4.5 * self.n_comp), constrained_layout=True)
         
-        values = self.local_errors[metric]
-        label = metric.replace('_', ' ').title()
-        
-        fig, ax = plt.subplots()
-        self._contour_plot(ax, values, label, cmap, levels)
-        
-        if title:
-            ax.set_title(title)
-        
+        # Ensure axs is a 2D array even if there's only one component
+        if self.n_comp == 1: 
+            axs = np.expand_dims(axs, axis=0)
+
+        metric_title = metric.replace('_', ' ').title()
+        col_titles = ['Ground Truth', 'Prediction', metric_title]
+
+        for i, label in enumerate(self.labels):
+            d = self.comp_data[label]
+            y_t, y_p = d['true'], d['pred']
+            err_val = d['errors'][metric]
+
+            # Enforce common color scale for True vs Pred in the current row
+            vmin, vmax = min(y_t.min(), y_p.min()), max(y_t.max(), y_p.max())
+
+            # Only show column headers on the very first row
+            t0 = col_titles[0] if i == 0 else None
+            t1 = col_titles[1] if i == 0 else None
+            t2 = col_titles[2] if i == 0 else None
+            
+            # Left column: Ground Truth (includes the Y-axis row label)
+            self._contour_plot(axs[i,0], y_t, t0, cmap, levels, vmin, vmax, False, row_label=label)
+            
+            # Middle column: Prediction
+            c2 = self._contour_plot(axs[i,1], y_p, t1, cmap, levels, vmin, vmax, False)
+            
+            # Shared colorbar for GT and Pred
+            fig.colorbar(c2, ax=axs[i, 0:2], aspect=30, pad=0.02)
+
+            # Right column: Metric Plot
+            m_cmap = 'coolwarm' if metric == 'difference' else 'plasma'
+            m_max = np.abs(err_val).max()
+            m_vmin, m_vmax = (-m_max, m_max) if metric == 'difference' else (0, m_max)
+            
+            self._contour_plot(axs[i,2], err_val, t2, m_cmap, levels, m_vmin, m_vmax, True)
+
         plt.show()
-    
-    def plot_comparison(self, metric='absolute_error', title=None, cmap='viridis', levels=50):
+
+    def plot_error_distribution(self, bins=50):
         """
-        Plot 3x1 subplots: y_true, y_pred, and the selected metric.
-        
-        Args:
-            metric (str): 'difference', 'absolute_error', or 'percentage_error'.
-            title (str, optional): Main figure title.
-            cmap (str): Matplotlib colormap (default: 'viridis').
-            levels (int): Number of contour levels (default: 50).
+        Plots histograms of the absolute error distribution for all components.
         """
-        if metric not in self.local_errors:
-            raise ValueError(f"Metric '{metric}' not available. Options: {list(self.local_errors.keys())}")
+        fig, axs = plt.subplots(1, self.n_comp, figsize=(7 * self.n_comp, 5))
+        if self.n_comp == 1: axs = [axs]
         
-        fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-        
-        # Plot y_true
-        self._contour_plot(axs[0], self.y_true, 'Ground Truth (y_true)', cmap, levels)
-        
-        # Plot y_pred
-        self._contour_plot(axs[1], self.y_pred, 'Prediction (y_pred)', cmap, levels)
-        
-        # Plot metric
-        values = self.local_errors[metric]
-        label = metric.replace('_', ' ').title()
-        self._contour_plot(axs[2], values, label, cmap, levels)
-        
-        if title:
-            fig.suptitle(title)
-        
+        for i, label in enumerate(self.labels):
+            error = self.comp_data[label]['errors']['absolute_error']
+            mae = np.mean(error)
+            
+            axs[i].hist(error, bins=bins, color='coral', edgecolor='black')
+            axs[i].set_yscale('log')
+            axs[i].set_xlabel(f'Absolute Error ({label})')
+            axs[i].set_ylabel('Node Count (Log Scale)')
+            axs[i].set_title(f'Error Distribution ({label})')
+            axs[i].axvline(mae, color='blue', linestyle='dashed', label=f'MAE: {mae:.2e}')
+            axs[i].legend()
+            
         plt.tight_layout()
         plt.show()
+
+    def report(self):
+        """
+        Computes R2, Relative L2, RMSE, MAE, and MAPE metrics for all components.
+        Returns a Pandas DataFrame.
+        """
+        rows = []
+        for label in self.labels:
+            yt, yp = self.comp_data[label]['true'], self.comp_data[label]['pred']
+            
+            r2 = r2_score(yt, yp)
+            mae = mean_absolute_error(yt, yp)
+            rmse = np.sqrt(mean_squared_error(yt, yp))
+            l2_rel = np.linalg.norm(yp - yt) / (np.linalg.norm(yt) + 1e-10)
+            
+            mask = np.abs(yt) > self.tol
+            mape = np.mean(np.abs((yp[mask] - yt[mask]) / yt[mask])) * 100 if np.any(mask) else 0.0
+            
+            rows.append({
+                'Component': label, 
+                'R2': r2, 
+                'L2_Rel': l2_rel, 
+                'RMSE': rmse, 
+                'MAE': mae, 
+                'MAPE%': mape
+            })
+            
+        return pd.DataFrame(rows).set_index('Component')
+
+    def export_to_vtk(self, filename="results.vtu"):
+        """
+        Exports solution fields to VTK/VTU format for ParaView.
+        Groups up to 3 components into 3D vectors for native Warp functionality.
+        """
+        try:
+            import meshio
+        except ImportError:
+            raise ImportError("Please install meshio to export to VTK: pip install meshio")
+            
+        pts = np.column_stack((self.mesh.coordinates, np.zeros(self.mesh.nnod)))
+        
+        # Prepare connectivity arrays
+        cls = []
+        if 'quad' in self.mesh.elements:
+            cls.append(("quad", np.array(self.mesh.elements['quad']) - 1))
+        if 'tri' in self.mesh.elements:
+            cls.append(("triangle", np.array(self.mesh.elements['tri']) - 1))
+            
+        def build_vector(data_key, sub_key=None):
+            """Helper to pack components into an (N, 3) vector array."""
+            vec = np.zeros((self.mesh.nnod, 3))
+            # Safely map up to 3 components to X, Y, Z channels
+            for i, label in enumerate(self.labels[:3]):
+                if sub_key:
+                    vec[:, i] = self.comp_data[label][data_key][sub_key]
+                else:
+                    vec[:, i] = self.comp_data[label][data_key]
+            return vec
+
+        # Define the point data fields
+        pdata = {
+            "Ground_Truth": build_vector('true'),
+            "Prediction": build_vector('pred'),
+            "Absolute_Error": build_vector('errors', 'absolute_error'),
+            "Difference": build_vector('errors', 'difference')
+        }
+            
+        meshio.Mesh(pts, cls, point_data=pdata).write(filename)
+        print(f"Exported Vector fields successfully to {filename}. Open it in ParaView!")
