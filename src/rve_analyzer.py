@@ -925,12 +925,12 @@ class RVEVisualizer:
         """
         tt = y_true[index]  # FEM
         zz = y_pred[index]  # FNO
-        
-        ph = 1.0 - phase[index].squeeze() 
-        
+
+        ph = 1.0 - phase[index].squeeze()
+
         # Get grid size
         L_x, L_y = tt.shape[0], tt.shape[1]
-        
+
         # If no cut lines are specified, take the center of the RVE
         if hline is None: hline = L_y // 2
         if vline is None: vline = L_x // 2
@@ -946,36 +946,58 @@ class RVEVisualizer:
         ver_pred = [zz[:, vline - 1, i] for i in range(3)]
         ver_phase = ph[:, vline - 1]
 
-        # Create 2x3 grid
-        fig, ax = plt.subplots(2, 3, figsize=(21, 10))
+        # Layout: 3 rows x 3 cols — top center: RVE overview; rows 1-2: cross-section plots
+        fig = plt.figure(figsize=(21, 14))
+        gs = fig.add_gridspec(3, 3, height_ratios=[1.0, 1.3, 1.3], hspace=0.45, wspace=0.3)
+
+        # --- RVE Overview (top center) ---
+        ax_rve = fig.add_subplot(gs[0, 1])
+        ax_rve.imshow(phase[index].squeeze(), cmap='gray', origin='lower', aspect='equal')
+        ax_rve.axhline(y=hline - 1, color='orangered', linewidth=3, alpha=0.9,
+                       label=f'Cut X  (Y = {hline})')
+        ax_rve.axvline(x=vline - 1, color='deepskyblue', linewidth=3, alpha=0.9,
+                       label=f'Cut Y  (X = {vline})')
+        ax_rve.set_title('RVE Phases', fontsize=14, fontweight='bold', pad=8)
+        ax_rve.set_xlabel('X', fontsize=11)
+        ax_rve.set_ylabel('Y', fontsize=11)
+        ax_rve.legend(fontsize=10, loc='center left',
+                      bbox_to_anchor=(1.05, 0.5),
+                      framealpha=0.85, edgecolor='gray')
+
+        # --- Cross-section subplots (rows 1 and 2) ---
+        ax = np.empty((2, 3), dtype=object)
+        for i in range(2):
+            for j in range(3):
+                ax[i, j] = fig.add_subplot(gs[i + 1, j])
+
         x_axis_hor = np.arange(L_x)
         x_axis_ver = np.arange(L_y)
-        
+
         comp_labels = [r'$\sigma_{xx}$', r'$\sigma_{yy}$', r'$\sigma_{xy}$']
 
         for j in range(3): # Iterate over columns (components)
-            
+
             # ==========================================
             # Row 0: Horizontal Plots (Cross-section X)
             # ==========================================
             ax0 = ax[0, j]
-            
+
             # 1. Plot Phase Background
             ax0_phase = ax0.twinx()
             ax0_phase.fill_between(x_axis_hor, 0, hor_phase, color='gray', alpha=0.3, step='mid', label='Phase')
             ax0_phase.set_ylim(0, 1) # Assuming phase is 0 or 1
             ax0_phase.set_yticks([]) # Hide secondary Y axis ticks
-            
+
             # 2. Plot True and Pred
-            l1 = ax0.plot(x_axis_hor, hor_true[j], linewidth=3, color='red', label='FEM')      
+            l1 = ax0.plot(x_axis_hor, hor_true[j], linewidth=3, color='red', label='FEM')
             l2 = ax0.plot(x_axis_hor, hor_pred[j], linewidth=3, color='black', label='DualEncoderFNO', linestyle='dashed')
 
             # Formatting
             ax0.set_title(f'{variable} {comp_labels[j]}', fontsize=18, pad=15)
-            ax0.set_xlabel(f'Cross-section X ($Y={hline}$)', fontsize=14, labelpad=10) 
+            ax0.set_xlabel(f'Cross-section X ($Y={hline}$)', fontsize=14, labelpad=10)
             ax0.set_ylabel(f'{comp_labels[j]} [MPa]', fontsize=14, labelpad=10)
             ax0.set_xlim(0, L_x - 1)
-            
+
             # Combine legends from both axes
             if j == 0:
                 lines, labels = ax0.get_legend_handles_labels()
@@ -996,22 +1018,22 @@ class RVEVisualizer:
             # Row 1: Vertical Plots (Cross-section Y)
             # ==========================================
             ax1 = ax[1, j]
-            
+
             # 1. Plot Phase Background
             ax1_phase = ax1.twinx()
             ax1_phase.fill_between(x_axis_ver, 0, ver_phase, color='gray', alpha=0.3, step='mid')
             ax1_phase.set_ylim(0, 1)
             ax1_phase.set_yticks([])
-            
+
             # 2. Plot True and Pred
-            ax1.plot(x_axis_ver, ver_true[j], linewidth=3, color='red', label='FEM')  
+            ax1.plot(x_axis_ver, ver_true[j], linewidth=3, color='red', label='FEM')
             ax1.plot(x_axis_ver, ver_pred[j], linewidth=3, color='black', label='DualEncoderFNO', linestyle='dashed')
 
             # Formatting
-            ax1.set_xlabel(f'Cross-section Y ($X={vline}$)', fontsize=14, labelpad=10) 
+            ax1.set_xlabel(f'Cross-section Y ($X={vline}$)', fontsize=14, labelpad=10)
             ax1.set_ylabel(f'{comp_labels[j]} [MPa]', fontsize=14, labelpad=10)
             ax1.set_xlim(0, L_y - 1)
-            
+
             if j == 0:
                 ax1.legend(loc='upper right', fontsize=12)
 
@@ -1024,7 +1046,6 @@ class RVEVisualizer:
             ax1.xaxis.set_minor_locator(AutoMinorLocator())
             ax1.yaxis.set_minor_locator(AutoMinorLocator())
 
-        plt.tight_layout()
         plt.show()
     
     @staticmethod
