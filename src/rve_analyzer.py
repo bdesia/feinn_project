@@ -1107,6 +1107,102 @@ class RVEVisualizer:
         fig.suptitle(title, y=1.05)
         plt.show()
 
+    @staticmethod
+    def plot_comparison(phase, y_true, y_pred, index):
+        """
+        4x3 summary grid for a single sample.
+
+        Layout
+        ------
+        Row 0 (centre col only): phase map.
+        Rows 1-3 (σ_xx, σ_yy, σ_xy):
+            col 0 — Ground-truth (FEM)  |  shared jet scale per row
+            col 1 — Predicted (FNO)     |  shared jet scale + colorbar between col 1 and 2
+            col 2 — Difference (FNO−FEM)   coolwarm, symmetric, colorbar on right
+
+        Row labels (σ_xx / σ_yy / σ_xy) on the left of col 0.
+        Column headers printed once on the first data row.
+
+        Args
+        ----
+        phase   : ndarray (N, H, W, ...)
+        y_true  : ndarray (N, H, W, 3)
+        y_pred  : ndarray (N, H, W, 3)
+        index   : int
+        """
+        comp_labels  = [r'$\sigma_{xx}$', r'$\sigma_{yy}$', r'$\sigma_{xy}$']
+        col_headers  = ['FEM', 'DualEncoderFNO', 'Difference']
+
+        data_phase = phase[index].squeeze()
+        h, w = y_true[index].shape[:2]
+        ext = [0, w, 0, h]
+
+        # Rows:    phase | vspacer | σ_xx | σ_yy | σ_xy
+        # Columns: FEM | hspacer | FNO | cb_fno | spacer | Diff | cb_diff
+        fig = plt.figure(figsize=(14, 15))
+        gs = fig.add_gridspec(5, 7,
+                              height_ratios=[0.5, 0.12, 1, 1, 1],
+                              width_ratios=[1, 0.1, 1, 0.06, 0.25, 1, 0.06],
+                              hspace=0.08, wspace=0.02)
+
+        # ── Row 0: phase map (col 2 = FNO column) ────────────────────────────
+        ax_phase = fig.add_subplot(gs[0, 2])
+        ax_phase.imshow(data_phase, cmap='gray', origin='lower', extent=ext)
+        ax_phase.set_title('RVE phases', fontsize=12, fontweight='bold')
+        ax_phase.set_xticks([])
+        ax_phase.set_yticks([])
+        ax_phase.set_aspect('equal')
+
+        # ── Rows 2-4: one row per stress component (row 1 is vspacer) ────────
+        for ch, label in enumerate(comp_labels):
+            row = ch + 2
+
+            data_true = y_true[index][:, :, ch]
+            data_pred = y_pred[index][:, :, ch]
+            diff      = data_pred - data_true
+
+            vmin_f  = min(data_true.min(), data_pred.min())
+            vmax_f  = max(data_true.max(), data_pred.max())
+            abs_max = np.abs(diff).max()
+
+            ax_fem   = fig.add_subplot(gs[row, 0])
+            # col 1 is the hspacer — not used
+            ax_fno   = fig.add_subplot(gs[row, 2])
+            cax_fno  = fig.add_subplot(gs[row, 3])
+            # col 4 is the spacer between FNO cb and Diff — not used
+            ax_diff  = fig.add_subplot(gs[row, 5])
+            cax_diff = fig.add_subplot(gs[row, 6])
+
+            ax_fem.imshow(data_true, cmap='jet', vmin=vmin_f, vmax=vmax_f,
+                          origin='lower', extent=ext)
+            im_fno  = ax_fno.imshow(data_pred, cmap='jet', vmin=vmin_f, vmax=vmax_f,
+                                    origin='lower', extent=ext)
+            im_diff = ax_diff.imshow(diff, cmap='coolwarm',
+                                     vmin=-abs_max, vmax=abs_max,
+                                     origin='lower', extent=ext)
+
+            # Column headers — only on first data row
+            if ch == 0:
+                for ax, hdr in zip([ax_fem, ax_fno, ax_diff], col_headers):
+                    ax.set_title(hdr, fontsize=12, pad=6)
+
+            # Row label on left of col 0
+            ax_fem.set_ylabel(label, fontsize=13, labelpad=8)
+
+            # Remove ticks from all data axes, keep border
+            for ax in [ax_fem, ax_fno, ax_diff]:
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.set_aspect('equal')
+
+            # Colorbars in dedicated axes
+            cb_f = fig.colorbar(im_fno,  cax=cax_fno)
+            cb_f.set_label('[MPa]', fontsize=9)
+            cb_d = fig.colorbar(im_diff, cax=cax_diff)
+            cb_d.set_label('[MPa]', fontsize=9)
+
+        plt.show()
+
 class EquilibriumLoss(object):
     """
     Enforces linear momentum balance (equilibrium) for RVE (strong form):
