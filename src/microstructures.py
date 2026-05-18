@@ -9,49 +9,58 @@ from typing import Tuple, Optional
 class MicrostructurePool:
     """
     Precomputes a pool of raw microstructures (phase + masks) indexed by fhard.
+
+    For each fhard bin, Nmicro independent microstructures are generated.
+    The pool is stored flat with shape (num_bins * Nmicro, ...).
+    The flat index for bin i, variant m is: i * Nmicro + m.
     """
     def __init__(self,
                  generator: object,
                  fhard_bins: torch.Tensor,
+                 Nmicro: int = 1,
                  meshing: bool = False,
                  delta_x: Optional[float] = 0.10,
                  delta_y: Optional[float] = 0.10,
                  device: str = 'cpu',
                  dtype: torch.dtype = torch.float64):
-        
+
         self.device = device
         self.dtype = dtype
         self.fhard_bins = fhard_bins.to(device=device, dtype=dtype)
         self.num_bins = len(fhard_bins)
+        self.Nmicro = Nmicro
 
-        print(f"Building MicrostructurePool with {self.num_bins} bins...")
+        total = self.num_bins * Nmicro
+        print(f"Building MicrostructurePool: {self.num_bins} bins × {Nmicro} variants = {total} microstructures...")
 
         pool_phase = []
         pool_mask_soft = []
         pool_mask_hard = []
         if meshing:
             pool_mesh = []
-            
-        for i, f in enumerate(self.fhard_bins):
-            phase, mask_soft, mask_hard = generator.generate(
-                f.item(), device=device, dtype=dtype
-            )
-            
-            pool_phase.append(phase)
-            pool_mask_soft.append(mask_soft)
-            pool_mask_hard.append(mask_hard)
-            if meshing:
-                pool_mesh.append(generator.to_mesh(lx=delta_x, ly=delta_y))
-                
-            if (i + 1) % 5 == 0 or i == self.num_bins - 1:
-                print(f"   → {i+1:2d}/{self.num_bins} microstructures generated")
 
-        self.pool_phase = torch.stack(pool_phase)      # (num_bins, C, H, W) raw
+        count = 0
+        for i, f in enumerate(self.fhard_bins):
+            for m in range(Nmicro):
+                phase, mask_soft, mask_hard = generator.generate(
+                    f.item(), device=device, dtype=dtype
+                )
+                pool_phase.append(phase)
+                pool_mask_soft.append(mask_soft)
+                pool_mask_hard.append(mask_hard)
+                if meshing:
+                    pool_mesh.append(generator.to_mesh(lx=delta_x, ly=delta_y))
+
+                count += 1
+                if count % 5 == 0 or count == total:
+                    print(f"   → {count:3d}/{total} microstructures generated")
+
+        self.pool_phase = torch.stack(pool_phase)       # (num_bins*Nmicro, C, H, W)
         self.pool_mask_soft = torch.stack(pool_mask_soft)
         self.pool_mask_hard = torch.stack(pool_mask_hard)
         if meshing:
-            self.pool_mesh = torch.stack(pool_mesh)
-        
+            self.meshes = pool_mesh                     # list of (mesh, lr_pairs, bt_pairs)
+
         print(f"MicrostructurePool ready | Shape: {self.pool_phase.shape}")
 
     def get_rves(self, tags: torch.Tensor) -> torch.Tensor:
@@ -68,11 +77,13 @@ class MicrostructurePool:
         Plot a grid of microstructures from the pool.
 
         Args:
-            indices: Optional 1-D tensor of bin indices to display. Defaults to all bins.
+            indices: Optional 1-D tensor of flat pool indices to display.
+                     Defaults to all entries (num_bins * Nmicro).
             max_cols: Maximum number of columns in the grid.
         """
+        total = self.num_bins * self.Nmicro
         if indices is None:
-            indices = torch.arange(self.num_bins)
+            indices = torch.arange(total)
         indices = indices.long().cpu()
         n = len(indices)
 
@@ -80,13 +91,16 @@ class MicrostructurePool:
         nrows = (n + ncols - 1) // ncols
 
         fig, axes = plt.subplots(nrows, ncols, figsize=(3 * ncols, 3 * nrows))
-        axes = np.array(axes).reshape(-1)  # flatten for uniform indexing
+        axes = np.array(axes).reshape(-1)
 
         for k, idx in enumerate(indices):
-            phase_np = self.pool_phase[idx].squeeze(0).cpu().numpy()
-            fval = self.fhard_bins[idx].item()
+            flat = idx.item()
+            phase_np = self.pool_phase[flat].squeeze(0).cpu().numpy()
+            bin_i = flat // self.Nmicro
+            var_i = flat % self.Nmicro
+            fval = self.fhard_bins[bin_i].item()
             axes[k].imshow(phase_np, cmap='viridis', origin='lower', vmin=0, vmax=1)
-            axes[k].set_title(f"bin {idx.item()}\nfhard={fval:.3f}", fontsize=8)
+            axes[k].set_title(f"bin {bin_i} / var {var_i}\nfhard={fval:.3f}", fontsize=8)
             axes[k].set_axis_off()
 
         for k in range(n, len(axes)):
