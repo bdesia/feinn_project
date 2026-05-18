@@ -608,16 +608,18 @@ class FNOmat(MaterialBase):
                  chunk_size: int = 48,
                  n_state: int = 3,
                  dtype: torch.dtype = torch.float32,
-                 device: str = 'cuda'):
-        
+                 device: str = 'cuda',
+                 seed: Optional[int] = None):
+
         super().__init__(n_state=n_state, dtype=dtype, device=device)
 
         self.model = model.to(device).eval()        # evaluation mode, no dropout/batchnorm updates
         self.model.requires_grad_(False)            # ensure no gradients for model parameters during solver backward pass
-        
+
         self.pool = microstructure_pool             # Pre-computed microstructure features for all Gauss points
         self.fhard = fhard                          # Function to compute fraction of hard phase from microstructure features
         self.chunk_size = chunk_size                # Number of samples to process per chunk during inference and autograd
+        self.seed = seed
 
         # Intance normalizers
         self.x_norm = normalizers['x_normalizer'].to(device)
@@ -649,17 +651,25 @@ class FNOmat(MaterialBase):
         return self
 
     def init_state(self, nelem: int, ngp: int, **kwargs) -> torch.Tensor:
-        coords = kwargs['coords']
         """Assign RVE tag based on spatial fhard distribution."""
-        fhard_eval = self.fhard(coords)                                     # must be in [0, 1]
-        fhard_eval = torch.clamp(fhard_eval, 0.0, 1.0)                      # Safety clamp (defensive programming)
-        
-        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
-        tags = torch.argmin(diffs, dim=-1)
+        coords = kwargs['coords']
+        fhard_eval = self.fhard(coords)
+        fhard_eval = torch.clamp(fhard_eval, 0.0, 1.0)
 
-        state = torch.zeros((nelem, ngp, self.n_state), 
+        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
+        bin_idx = torch.argmin(diffs, dim=-1)                               # (nelem, ngp)
+
+        gen = torch.Generator(device=self.device)
+        if self.seed is not None:
+            gen.manual_seed(self.seed)
+        micro_idx = torch.randint(0, self.pool.Nmicro, bin_idx.shape,
+                                  generator=gen, device=self.device)
+
+        tags = bin_idx * self.pool.Nmicro + micro_idx                       # flat pool index
+
+        state = torch.zeros((nelem, ngp, self.n_state),
                             dtype=self.dtype, device=self.device)
-        state[..., 0] = tags.to(self.dtype)                                 # RVE index
+        state[..., 0] = tags.to(self.dtype)
         return state
 
     def update_state(self, strain: torch.Tensor, state_old: torch.Tensor, isTangent: bool = True):
@@ -788,6 +798,7 @@ class FEMmat(MaterialBase):
                  device: str = 'cuda',
                  exact_integration: bool = False,
                  fd_scheme: str = 'forward',
+                 seed: Optional[int] = None,
                  **kwargs):
 
         super().__init__(n_state=n_state, dtype=dtype, device=device, **kwargs)
@@ -799,6 +810,7 @@ class FEMmat(MaterialBase):
         self.fhard = fhard
         self.exact_integration = exact_integration
         self.fd_scheme = fd_scheme
+        self.seed = seed
 
         self.matfield = {
             'soft_s': soft,
@@ -818,7 +830,15 @@ class FEMmat(MaterialBase):
         fhard_eval = torch.clamp(fhard_eval, 0.0, 1.0)
 
         diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
-        tags = torch.argmin(diffs, dim=-1)
+        bin_idx = torch.argmin(diffs, dim=-1)                               # (nelem, ngp)
+
+        gen = torch.Generator(device=self.device)
+        if self.seed is not None:
+            gen.manual_seed(self.seed)
+        micro_idx = torch.randint(0, self.pool.Nmicro, bin_idx.shape,
+                                  generator=gen, device=self.device)
+
+        tags = bin_idx * self.pool.Nmicro + micro_idx                       # flat pool index
 
         state = torch.zeros((nelem, ngp, self.n_state),
                             dtype=self.dtype, device=self.device)
