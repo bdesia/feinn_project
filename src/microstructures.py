@@ -10,14 +10,14 @@ class MicrostructurePool:
     """
     Precomputes a pool of raw microstructures (phase + masks) indexed by fhard.
 
-    For each fhard bin, Nmicro independent microstructures are generated.
-    The pool is stored flat with shape (num_bins * Nmicro, ...).
-    The flat index for bin i, variant m is: i * Nmicro + m.
+    For each fhard bin, nmicro independent microstructures are generated.
+    The pool is stored flat with shape (num_bins * nmicro, ...).
+    The flat index for bin i, variant m is: i * nmicro + m.
     """
     def __init__(self,
                  generator: object,
                  fhard_bins: torch.Tensor,
-                 Nmicro: int = 1,
+                 nmicro: int = 1,
                  meshing: bool = False,
                  delta_x: Optional[float] = 0.10,
                  delta_y: Optional[float] = 0.10,
@@ -28,10 +28,10 @@ class MicrostructurePool:
         self.dtype = dtype
         self.fhard_bins = fhard_bins.to(device=device, dtype=dtype)
         self.num_bins = len(fhard_bins)
-        self.Nmicro = Nmicro
+        self.nmicro = nmicro
 
-        total = self.num_bins * Nmicro
-        print(f"Building MicrostructurePool: {self.num_bins} bins × {Nmicro} variants = {total} microstructures...")
+        total = self.num_bins * nmicro
+        print(f"Building MicrostructurePool: {self.num_bins} bins × {nmicro} variants = {total} microstructures...")
 
         pool_phase = []
         pool_mask_soft = []
@@ -41,7 +41,7 @@ class MicrostructurePool:
 
         count = 0
         for i, f in enumerate(self.fhard_bins):
-            for m in range(Nmicro):
+            for m in range(nmicro):
                 phase, mask_soft, mask_hard = generator.generate(
                     f.item(), device=device, dtype=dtype
                 )
@@ -55,7 +55,7 @@ class MicrostructurePool:
                 if count % 5 == 0 or count == total:
                     print(f"   → {count:3d}/{total} microstructures generated")
 
-        self.pool_phase = torch.stack(pool_phase)       # (num_bins*Nmicro, C, H, W)
+        self.pool_phase = torch.stack(pool_phase)       # (num_bins*nmicro, C, H, W)
         self.pool_mask_soft = torch.stack(pool_mask_soft)
         self.pool_mask_hard = torch.stack(pool_mask_hard)
         if meshing:
@@ -78,10 +78,10 @@ class MicrostructurePool:
 
         Args:
             indices: Optional 1-D tensor of flat pool indices to display.
-                     Defaults to all entries (num_bins * Nmicro).
+                     Defaults to all entries (num_bins * nmicro).
             max_cols: Maximum number of columns in the grid.
         """
-        total = self.num_bins * self.Nmicro
+        total = self.num_bins * self.nmicro
         if indices is None:
             indices = torch.arange(total)
         indices = indices.long().cpu()
@@ -96,8 +96,8 @@ class MicrostructurePool:
         for k, idx in enumerate(indices):
             flat = idx.item()
             phase_np = self.pool_phase[flat].squeeze(0).cpu().numpy()
-            bin_i = flat // self.Nmicro
-            var_i = flat % self.Nmicro
+            bin_i = flat // self.nmicro
+            var_i = flat % self.nmicro
             fval = self.fhard_bins[bin_i].item()
             axes[k].imshow(phase_np, cmap='viridis', origin='lower', vmin=0, vmax=1)
             axes[k].set_title(f"bin {bin_i} / var {var_i}\nfhard={fval:.3f}", fontsize=8)

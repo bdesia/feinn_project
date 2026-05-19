@@ -656,16 +656,17 @@ class FNOmat(MaterialBase):
         fhard_eval = self.fhard(coords)
         fhard_eval = torch.clamp(fhard_eval, 0.0, 1.0)
 
-        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
+        fhard_bins = self.pool.fhard_bins.to(device=fhard_eval.device)
+        diffs = torch.abs(fhard_eval.unsqueeze(-1) - fhard_bins)
         bin_idx = torch.argmin(diffs, dim=-1)                               # (nelem, ngp)
 
-        gen = torch.Generator(device=self.device)
+        gen = torch.Generator(device='cpu')   # always CPU so same seed → same sequence on any device
         if self.seed is not None:
             gen.manual_seed(self.seed)
-        micro_idx = torch.randint(0, self.pool.Nmicro, bin_idx.shape,
-                                  generator=gen, device=self.device)
+        micro_idx = torch.randint(0, self.pool.nmicro, bin_idx.shape,
+                                  generator=gen).to(self.device)
 
-        tags = bin_idx * self.pool.Nmicro + micro_idx                       # flat pool index
+        tags = bin_idx.to(self.device) * self.pool.nmicro + micro_idx        # flat pool index
 
         state = torch.zeros((nelem, ngp, self.n_state),
                             dtype=self.dtype, device=self.device)
@@ -829,16 +830,17 @@ class FEMmat(MaterialBase):
         fhard_eval = self.fhard(coords)
         fhard_eval = torch.clamp(fhard_eval, 0.0, 1.0)
 
-        diffs = torch.abs(fhard_eval.unsqueeze(-1) - self.pool.fhard_bins)
+        fhard_bins = self.pool.fhard_bins.to(device=fhard_eval.device)
+        diffs = torch.abs(fhard_eval.unsqueeze(-1) - fhard_bins)
         bin_idx = torch.argmin(diffs, dim=-1)                               # (nelem, ngp)
 
-        gen = torch.Generator(device=self.device)
+        gen = torch.Generator(device='cpu')   # always CPU so same seed → same sequence on any device
         if self.seed is not None:
             gen.manual_seed(self.seed)
-        micro_idx = torch.randint(0, self.pool.Nmicro, bin_idx.shape,
-                                  generator=gen, device=self.device)
+        micro_idx = torch.randint(0, self.pool.nmicro, bin_idx.shape,
+                                  generator=gen).to(self.device)
 
-        tags = bin_idx * self.pool.Nmicro + micro_idx                       # flat pool index
+        tags = bin_idx.to(self.device) * self.pool.nmicro + micro_idx      # flat pool index
 
         state = torch.zeros((nelem, ngp, self.n_state),
                             dtype=self.dtype, device=self.device)
@@ -869,8 +871,16 @@ class FEMmat(MaterialBase):
             if isTangent:
                 ddsdde_flat[i] = self._compute_numerical_tangent(macro_e, tag, sigma_hom)
 
+        stress_out = stress_flat.view(nelem, ngp, 3)
+        self._stress_cache = stress_out.clone()   # reused by get_stress_field()
         ddsdde = ddsdde_flat.view(nelem, ngp, 3, 3) if isTangent else None
-        return stress_flat.view(nelem, ngp, 3), state_old, ddsdde
+        return stress_out, state_old, ddsdde
+
+    def get_stress_field(self) -> torch.Tensor:
+        """Return the stress field from the last converged Newton iteration (no RVE re-runs)."""
+        if not hasattr(self, '_stress_cache'):
+            raise RuntimeError("No stress cached yet — run the FEM² solve first.")
+        return self._stress_cache
 
     def _solve_rve(self, macro_strain: torch.Tensor, tag: int) -> torch.Tensor:
         """
