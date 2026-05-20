@@ -405,6 +405,34 @@ class BaseSolver:
 
         return Fint
 
+    def compute_stresses(self) -> torch.Tensor:
+        """
+        Compute stress tensor at Gauss points using the current displacement field.
+
+        Returns
+        -------
+        torch.Tensor, shape (total_nelem, ngauss, 3)
+            [σxx, σyy, τxy] at each Gauss point, sorted by element ID.
+
+        Note
+        ----
+        For FEMmat (FEM²) this re-runs all RVE solves and is very expensive.
+        """
+        all_ids, all_sigma = [], []
+        with torch.no_grad():
+            for batch in self.quad_batches.values():
+                u_local = batch.get_local_disp(self.udisp)
+                eps_gp  = batch.compute_infinitesimal_strain(u_local)
+                sigma_gp, _, _ = batch.material.update_state(
+                    eps_gp, batch.state, isTangent=False
+                )
+                all_ids.append(batch.ids.cpu())
+                all_sigma.append(sigma_gp.detach().cpu())
+
+        ids   = torch.cat(all_ids)
+        sigma = torch.cat(all_sigma, dim=0)
+        return sigma[torch.argsort(ids)]
+
     def set_load_factor(self, lam: float):
         """
         Set the current load factor λ and update external force vector.
@@ -608,7 +636,7 @@ class BaseSolver:
                 show_original_mesh: bool = True, 
                 show_nodes: bool = True,
                 original_alpha: float = 0.3,
-                cmap: str = 'viridis',
+                cmap: str = 'jet',
                 title: str = None,
                 figsize: tuple = (11, 9),
                 vmin: float = None,
@@ -1236,7 +1264,7 @@ class FEINN(BaseSolver):
     
         if warmup:
             print("[FEINN] Starting warmup for zero initial displacement")
-            self.warmup_zero_displacement(epochs=1000, lr=1e-4)
+            self.warmup_zero_displacement(epochs=2000, lr=1e-4)
             # Final prediction
             with torch.no_grad():
                 initial_disp = self.nnet(self.coords_tensor)   
