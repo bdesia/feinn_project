@@ -13,6 +13,32 @@ It is divided in two stages:
 
 This project was developed as part of the CEIA (Curso de Especialización en Inteligencia Artificial) at FIUBA (Facultad de Ingeniería, Universidad de Buenos Aires).
 
+```mermaid
+graph TD
+    %% Estilos globales
+    classDef default fill:#f9f9f9,stroke:#333,stroke-width:1px,color:#333;
+    classDef core fill:#e1f5fe,stroke:#03a9f4,stroke-width:2px,color:#01579b;
+    classDef ML fill:#f3e5f5,stroke:#9c27b0,stroke-width:2px,color:#4a148c;
+
+    UTILS[src/utils<br>Shape Functions & Gauss] --> ELEMENTS[src/elements<br>Elemento 2D Local]
+    UTILS --> BATCH_ELEMENTS[src/batch_elements<br>Cálculo Vectorizado GPU]
+    
+    ELEMENTS --> BATCH_ELEMENTS
+    
+    BATCH_ELEMENTS --> SOLVER[src/solver<br>NFEA / FEINN]
+    CONDITIONS[src/conditions<br>Cargas & Dirichlet BCs] --> SOLVER
+    MATERIALS[src/materials<br>Modelos Constitutivos] --> SOLVER
+    
+    DATA_GEN[src/data_generator<br>Trayectorias RBF] --> MICRO[src/microstructures<br>Generación RVE]
+    MICRO --> RVE_ANALYZER[src/rve_analyzer & nn_models<br>DualEncoderFNO]
+    
+    RVE_ANALYZER -->|Inferencia Constitutiva| MATERIALS
+    RVE_ANALYZER --> EVALUATOR[src/evaluator<br>Métricas & Plots]
+
+    class SOLVER,ELEMENTS,BATCH_ELEMENTS core;
+    class RVE_ANALYZER,DATA_GEN ML;
+```
+
 ## Project structure
 
 The project was structured as follows. 
