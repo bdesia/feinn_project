@@ -45,13 +45,15 @@ The project was structured as follows.
 
 ```
 ├── notebooks                           # Jupyter notebooks for interactive data analysis or modelling 
-│   ├── FEINN_example N                 # Sub-folder of notebooks used for FEINN approach testing case N
+│   ├── meshes                          # Contains macroscopic meshes in ".med" format getting from SMESH module from Salome platform.
+│   ├── FEINN_example<<N>>              # Sub-folder of notebooks used for FEINN approach testing case N
 │   └── RVE_data_generation             # Sub-folder of notebooks used for FNO subrogate model.
 │       ├── checkpoints                 # Here you must find HPO data and trained model configuration.
 │       ├── data                        # Finite-Element solutions for training model. One file per case.
 │       ├── master_data                 # Whole dataset in a single file, divided in train/val/test, with normalizers stats.
 │       ├── meshes                      # FE meshes for data generation.
-│       └── strain_histories            # Synthetic generated strain paths for data generation.
+│       ├── strain_histories            # Synthetic generated strain paths for data generation.
+│       └── RVE<<N>>                    # Specific case of application
 └── src                                 # Main source of the project
 ```
 
