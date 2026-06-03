@@ -13,18 +13,19 @@ from typing import Optional
 class BaseSolver:
     "Base class for different types of solvers for 2D problems"
 
-    def __init__(self,  mesh: object, 
-                        bcs: BoundaryConditions, 
-                        matfld: dict, 
+    def __init__(self,  mesh: object,
+                        bcs: BoundaryConditions,
+                        matfld: dict,
                         thickness: float = 1.0,
-                        body_loads: BodyLoads = None, 
-                        edge_loads: EdgeLoads  = None, 
+                        body_loads: BodyLoads = None,
+                        edge_loads: EdgeLoads  = None,
                         line_loads: LineLoads  = None,
                         nodal_loads: NodalLoads  = None,
                         mpcs: MultiPointConstraints = None,
                         formulation: str = 'infinitesimal',
                         device: torch.device = None,
-                        verbose: bool = False):
+                        verbose: bool = False,
+                        dtype: torch.dtype = torch.float32):
         """
         Parameters (mandatory)
         ----------
@@ -75,8 +76,7 @@ class BaseSolver:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         else:
             self.device = device
-        self.dtype = None
-        self._set_dtype()
+        self.dtype = dtype
 
         self.coords_tensor = torch.tensor(
             self.coordinates, dtype=self.dtype, device=self.device)  # (nnod, 2)
@@ -122,9 +122,6 @@ class BaseSolver:
     # ========================================
     # BASE METHODS
     # ========================================
-
-    def _set_dtype(self):
-        pass
 
     def _reinit(self):
         self.udisp.zero_()
@@ -764,22 +761,22 @@ class NFEA(BaseSolver):
     """
     This class implements a nonlinear finite element solver
     """
-    def __init__(self,  mesh: object, 
-                        bcs: BoundaryConditions, 
-                        matfld: dict, 
+    def __init__(self,  mesh: object,
+                        bcs: BoundaryConditions,
+                        matfld: dict,
                         thickness: float = 1.0,
-                        body_loads: BodyLoads = None, 
-                        edge_loads: EdgeLoads  = None, 
+                        body_loads: BodyLoads = None,
+                        edge_loads: EdgeLoads  = None,
                         line_loads: LineLoads  = None,
                         nodal_loads: NodalLoads  = None,
                         mpcs: MultiPointConstraints = None,
                         formulation: str = 'infinitesimal',
                         device: torch.device = None,
                         verbose: bool = False):
-        
-        super().__init__(mesh, bcs, matfld, thickness, 
+
+        super().__init__(mesh, bcs, matfld, thickness,
                          body_loads, edge_loads, line_loads, nodal_loads, mpcs,
-                         formulation, device, verbose)
+                         formulation, device, verbose, dtype=torch.float64)
     
         if 'quad' in mesh.elements.keys():
             self.all_i_flat = torch.cat([batch.dofs[:, :, None].expand(-1, -1, batch.ndof_local).reshape(-1) 
@@ -817,9 +814,6 @@ class NFEA(BaseSolver):
             
             if self.verbose:
                 print(f"[NFEA] {num_mpcs} MultiPointConstraints precomputed")
-
-    def _set_dtype(self):
-        self.dtype = torch.float64
 
     def _assemble_internal_and_stiffness(self, 
         u: torch.Tensor = None, 
@@ -984,13 +978,13 @@ class FEINN(BaseSolver):
     Dirichlet boundary conditions enforced SOFTLY via penalty method.
     """
     
-    def __init__(self, 
-                 mesh: object, 
-                 bcs: BoundaryConditions, 
-                 matfld: dict, 
+    def __init__(self,
+                 mesh: object,
+                 bcs: BoundaryConditions,
+                 matfld: dict,
                  thickness: float = 1.0,
-                 body_loads: BodyLoads = None, 
-                 edge_loads: EdgeLoads = None, 
+                 body_loads: BodyLoads = None,
+                 edge_loads: EdgeLoads = None,
                  line_loads: LineLoads  = None,
                  nodal_loads: NodalLoads = None,
                  mpcs: MultiPointConstraints = None,
@@ -1003,11 +997,12 @@ class FEINN(BaseSolver):
                  bc_type: Optional[str] = 'soft',       # Must be 'soft' or 'hard'
                  bc_weight: float = 1e4,                # Penalty weight for soft BCs
                  normalize_coords = True,
+                 dtype: torch.dtype = torch.float32,
                  ):
 
-        super().__init__(mesh, bcs, matfld, thickness, 
+        super().__init__(mesh, bcs, matfld, thickness,
                          body_loads, edge_loads, line_loads, nodal_loads, mpcs,
-                         formulation, device, verbose)
+                         formulation, device, verbose, dtype=dtype)
         
         if bc_type not in ('soft', 'hard'):
             raise ValueError(f"bc_type must be 'soft' or 'hard', got '{bc_type}'")
@@ -1059,25 +1054,13 @@ class FEINN(BaseSolver):
             else:
                 self._bc_nodes = None
 
-        # === SET L-BFGS OPTIMIZER ===
-        self.lbfgs_optimizer = torch.optim.LBFGS(
-            self.nnet.parameters(),
-            lr=1.0,
-            max_iter=20,
-            history_size=100,
-            line_search_fn="strong_wolfe",
-            tolerance_grad=1e-10,           # default 1e-7
-            tolerance_change=1e-9,
-        )
+        # L-BFGS optimizer is created fresh in each train() call (see train method).
 
         self.maxit = 100        # Maximum number of iterations
     
         self.dtol = 1e-6        # Displacement tolerance
         self.etol = 1e-6        # Energy tolerance 
         self.ftol = 1e-6        # Force tolerance
-
-    def _set_dtype(self):
-        self.dtype = torch.float32
 
     def _build_hard_bc_tensors(self) -> None:
         """
@@ -1135,10 +1118,13 @@ class FEINN(BaseSolver):
         X = self.coords_tensor
         self.nnet.train()
 
+        nnet_dtype = next(self.nnet.parameters()).dtype
+        X = X.to(dtype=nnet_dtype)
+
         if self.bc_type == 'hard':
             # Target: free nodes must be ≈ 0
             # u_hard = φ * u_NN + u_Γ → we seek for φ * u_NN ≈ 0
-            target = self._hard_u_gam                       # (nnod, 2)
+            target = self._hard_u_gam.to(dtype=nnet_dtype)
             for _ in range(epochs):
                 optimizer.zero_grad()
                 u_hard = self._apply_hard_bc(self.nnet(X))
@@ -1147,7 +1133,7 @@ class FEINN(BaseSolver):
                 optimizer.step()
         else:
             # Soft: whole output ≈ 0
-            target = torch.zeros(self.nnod, 2, dtype=self.dtype, device=self.device)
+            target = torch.zeros(self.nnod, 2, dtype=nnet_dtype, device=self.device)
             for _ in range(epochs):
                 optimizer.zero_grad()
                 loss = self.loss_fun(self.nnet(X), target)
@@ -1318,14 +1304,29 @@ class FEINN(BaseSolver):
         # ========================================
         
         if lbfgs_epochs > 0:
+            # Fresh optimizer each call — stale Hessian history from previous
+            # train() calls causes L-BFGS to take wrong steps after warmup resets
+            # the network weights to a different region of parameter space.
+            tol_grad = 1e-7 if self.dtype == torch.float32 else 1e-10
+            tol_change = 1e-6 if self.dtype == torch.float32 else 1e-9
+            lbfgs_optimizer = torch.optim.LBFGS(
+                self.nnet.parameters(),
+                lr=1.0,
+                max_iter=20,
+                history_size=100,
+                line_search_fn="strong_wolfe",
+                tolerance_grad=tol_grad,
+                tolerance_change=tol_change,
+            )
+
             def closure():
-                self.lbfgs_optimizer.zero_grad()
+                lbfgs_optimizer.zero_grad()
                 total_loss, _, _, _ = self._compute_total_loss(model)
                 total_loss.backward()
                 return total_loss
 
             for epoch in range(1, lbfgs_epochs + 1):
-                loss = self.lbfgs_optimizer.step(closure)
+                loss = lbfgs_optimizer.step(closure)
 
                 with torch.no_grad():
                     total_loss, loss_domain, loss_bc, loss_data = self._compute_total_loss(model)
