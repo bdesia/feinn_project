@@ -25,7 +25,7 @@ class BaseSolver:
                         formulation: str = 'infinitesimal',
                         device: torch.device = None,
                         verbose: bool = False,
-                        dtype: torch.dtype = torch.float32):
+                        dtype: torch.dtype = torch.float64):
         """
         Parameters (mandatory)
         ----------
