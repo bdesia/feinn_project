@@ -291,7 +291,8 @@ class BaseSolver:
 
             batch = QuadElement(ids=elem_ids, 
                                 nodes_list=nodes_list, 
-                                thickness = self.thickness, 
+                                thickness = self.thickness,
+                                dtype=self.dtype, 
                                 device=self.device,
                                 )
             batch._assign_nodal_coordinates(self.coords_tensor)
@@ -321,7 +322,8 @@ class BaseSolver:
 
             batch = QuadElement(ids=elem_ids, 
                                 nodes_list=nodes_list, 
-                                thickness = self.thickness, 
+                                thickness = self.thickness,
+                                dtype=self.dtype, 
                                 device=self.device,
                                 )
             batch._assign_nodal_coordinates(self.coords_tensor)
